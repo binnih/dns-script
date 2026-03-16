@@ -1,37 +1,16 @@
 #!/usr/bin/env python3
 """
-dns_lookup.py - Comprehensive DNS record lookup tool
+dns_lookup.py - Comprehensive DNS lookup tool.
 
 Usage:
-  python3 dns_lookup.py example.com
-  python3 dns_lookup.py example.com another.com
-  python3 dns_lookup.py -f domains.txt
-  python3 dns_lookup.py -f domains.txt -r A MX TXT
-  python3 dns_lookup.py example.com --json
-  python3 dns_lookup.py example.com --resolver 8.8.8.8
-  python3 dns_lookup.py example.com --whois
-  python3 dns_lookup.py example.com --mail-audit
-  python3 dns_lookup.py example.com --axfr
-  python3 dns_lookup.py example.com --http
-  python3 dns_lookup.py example.com --ssl
-  python3 dns_lookup.py example.com --rbl
-  python3 dns_lookup.py example.com --cdn
-  python3 dns_lookup.py example.com --mx-ports
-  python3 dns_lookup.py example.com --subdomains
-  python3 dns_lookup.py example.com --propagation
-  python3 dns_lookup.py example.com --dns-timing
-  python3 dns_lookup.py example.com --all-checks
-  python3 dns_lookup.py example.com --output results.txt
-  python3 dns_lookup.py example.com --mail-headers
-  python3 dns_lookup.py example.com --summary
-  python3 dns_lookup.py example.com --dnssec
-  python3 dns_lookup.py example.com --portscan
-  python3 dns_lookup.py example.com --cert-chain
-  python3 dns_lookup.py example.com --rdns
-  python3 dns_lookup.py example.com --ipv6
-  python3 dns_lookup.py example.com --watch 30
-  python3 dns_lookup.py --compare example.com another.com
+  python3 dns_lookup.py example.com [--all-checks] [--output FILE]
+  python3 dns_lookup.py -f domains.txt [--summary] [--hide-empty]
+  python3 dns_lookup.py --compare domain-a.com domain-b.com
+  python3 dns_lookup.py --watch 30 example.com
+  python3 dns_lookup.py --mail-headers
   python3 dns_lookup.py --init-config
+
+Run with --help for the full list of options.
 """
 
 import sys
@@ -43,7 +22,6 @@ import urllib.request
 import urllib.error
 import ssl
 import time
-import ipaddress
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
@@ -191,15 +169,37 @@ def format_record(rtype, rdata):
     if rtype == "CAA":
         return f"[flags {rdata.flags}]  {rdata.tag.decode()} = {rdata.value.decode()}"
     if rtype == "TXT":
-        parts = [p.decode(errors="replace") if isinstance(p, bytes) else p
-                 for p in rdata.strings]
-        return " ".join(parts)
+        return decode_txt(rdata)
     return str(rdata)
 
 
 def lookup(domain, rtype, resolver):
     answers = resolver.resolve(domain, rtype)
     return [(answers.rrset.ttl, format_record(rtype, r)) for r in answers]
+
+
+def decode_txt(rdata):
+    """Join all strings in a TXT record into a single string."""
+    return " ".join(
+        p.decode(errors="replace") if isinstance(p, bytes) else p
+        for p in rdata.strings
+    )
+
+
+def resolve_ips(domain, resolver, rtype="A"):
+    """Return a list of IP strings for a domain, or [] on failure."""
+    try:
+        return [str(r) for r in resolver.resolve(domain, rtype)]
+    except Exception:
+        return []
+
+
+def resolve_ns(domain, resolver):
+    """Return a list of nameserver hostnames for a domain, or [] on failure."""
+    try:
+        return [str(r.target).rstrip(".") for r in resolver.resolve(domain, "NS")]
+    except Exception:
+        return []
 
 
 # ── Pretty printer ────────────────────────────────────────────────────────────
@@ -246,6 +246,13 @@ def ok(msg):   return f"{C.GREEN}✔  {msg}{C.RESET}"
 def warn(msg): return f"{C.YELLOW}⚠  {msg}{C.RESET}"
 def fail(msg): return f"{C.RED}✘  {msg}{C.RESET}"
 def info(msg): return f"{C.BLUE}ℹ  {msg}{C.RESET}"
+
+
+def print_findings(findings):
+    """Print a list of (level, message) tuples using ok/warn/fail/info."""
+    dispatch = {"ok": ok, "warn": warn, "fail": fail, "info": info}
+    for level, msg in findings:
+        print(f"  {dispatch.get(level, info)(msg)}")
 
 
 # ── Core DNS lookup ───────────────────────────────────────────────────────────
@@ -400,8 +407,7 @@ def check_dkim(domain, resolver, extra_selectors=None):
         try:
             answers = resolver.resolve(qname, "TXT")
             for r in answers:
-                txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                               for p in r.strings)
+                txt = decode_txt(r)
                 if "v=DKIM1" in txt or "p=" in txt:
                     found.append((sel, txt))
         except Exception:
@@ -418,8 +424,7 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
     try:
         answers = resolver.resolve(domain, "TXT")
         for r in answers:
-            txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                           for p in r.strings)
+            txt = decode_txt(r)
             if txt.startswith("v=spf1"):
                 spf_records.append(txt)
     except Exception:
@@ -433,11 +438,7 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
             print(f"  {C.DIM}  {r}{C.RESET}")
     else:
         print(f"  {C.DIM}  {spf_records[0]}{C.RESET}")
-        for level, msg in parse_spf(spf_records[0]):
-            if level == "ok":     print(f"  {ok(msg)}")
-            elif level == "warn": print(f"  {warn(msg)}")
-            elif level == "fail": print(f"  {fail(msg)}")
-            else:                 print(f"  {info(msg)}")
+        print_findings(parse_spf(spf_records[0]))
 
     # Mail deliverability score
     spf_score  = 1 if len(spf_records) == 1 and any(l == "ok"   for l, _ in (parse_spf(spf_records[0]) if spf_records else [])) else 0
@@ -449,16 +450,11 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
     try:
         answers = resolver.resolve(f"_dmarc.{domain}", "TXT")
         for r in answers:
-            txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                           for p in r.strings)
+            txt = decode_txt(r)
             if "DMARC1" in txt:
                 print(f"  {C.DIM}  {txt}{C.RESET}")
                 findings = parse_dmarc(txt)
-                for level, msg in findings:
-                    if level == "ok":     print(f"  {ok(msg)}")
-                    elif level == "warn": print(f"  {warn(msg)}")
-                    elif level == "fail": print(f"  {fail(msg)}")
-                    else:                 print(f"  {info(msg)}")
+                print_findings(findings)
                 if any(l == "ok" for l, _ in findings):
                     dmarc_score = 1
     except dns.resolver.NXDOMAIN:
@@ -495,14 +491,7 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
 
 def do_axfr(domain, resolver):
     print_section_header("ZONE TRANSFER (AXFR)", C.MAGENTA)
-    ns_list = []
-    try:
-        answers = resolver.resolve(domain, "NS")
-        ns_list = [str(r.target).rstrip(".") for r in answers]
-    except Exception as e:
-        print(f"  {fail(f'Could not get NS records: {e}')}")
-        return
-
+    ns_list = resolve_ns(domain, resolver)
     if not ns_list:
         print(f"  {fail('No NS records found')}")
         return
@@ -701,13 +690,7 @@ def do_rbl_check(domain, resolver):
     print_section_header("BLACKLIST / RBL CHECK", C.MAGENTA)
 
     # Collect IPs from A records
-    ips = []
-    try:
-        answers = resolver.resolve(domain, "A")
-        ips = [str(r) for r in answers]
-    except Exception:
-        pass
-
+    ips = resolve_ips(domain, resolver)
     if not ips:
         print(f"  {warn('No A records found — cannot check RBL')}")
         return
@@ -1259,8 +1242,7 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
     try:
         answers = resolver.resolve(f"_dmarc.{domain}", "TXT")
         for r in answers:
-            txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                           for p in r.strings)
+            txt = decode_txt(r)
             if "DMARC1" in txt:
                 m = re.search(r"p=(\w+)", txt)
                 row["dmarc"] = m.group(1).lower() if m else "found"
@@ -1409,12 +1391,9 @@ def scan_port(ip, port, timeout=2):
 def do_port_scan(domain, resolver, timeout=2):
     print_section_header("PORT SCAN", C.MAGENTA)
 
-    ips = []
-    try:
-        answers = resolver.resolve(domain, "A")
-        ips = [str(r) for r in answers]
-    except Exception as e:
-        print(f"  {fail(f'Could not resolve A records: {e}')}")
+    ips = resolve_ips(domain, resolver)
+    if not ips:
+        print(f"  {fail('Could not resolve A records')}")
         return
 
     for ip in ips:
@@ -1530,12 +1509,9 @@ def do_cert_chain(domain, timeout=8):
 def do_rdns(domain, resolver):
     print_section_header("REVERSE DNS CONSISTENCY", C.MAGENTA)
 
-    ips = []
-    try:
-        answers = resolver.resolve(domain, "A")
-        ips = [str(r) for r in answers]
-    except Exception as e:
-        print(f"  {fail(f'Could not resolve A records: {e}')}")
+    ips = resolve_ips(domain, resolver)
+    if not ips:
+        print(f"  {fail('Could not resolve A records')}")
         return
 
     for ip in ips:
@@ -2037,7 +2013,7 @@ def main():
     apply_config(args, cfg)
 
     # Handle --init-config
-    if getattr(args, 'init_config', False):
+    if args.init_config:
         create_default_config()
         sys.exit(0)
 
@@ -2053,7 +2029,7 @@ def main():
     if args.file:
         domains += load_domains_from_file(args.file)
 
-    if not domains and not getattr(args, 'compare', None) and not getattr(args, 'init_config', False):
+    if not domains and not args.compare and not args.init_config:
         print(f"{C.RED}Error: provide at least one domain or use -f <file>{C.RESET}")
         sys.exit(1)
 
@@ -2065,26 +2041,18 @@ def main():
 
     resolver = build_resolver(args.resolver, args.timeout)
 
-    run_whois       = args.whois       or args.all_checks
-    run_mail_audit  = args.mail_audit  or args.all_checks
-    run_axfr        = args.axfr        or args.all_checks
-    run_http        = args.http        or args.all_checks
-    run_ssl         = args.ssl         or args.all_checks
-    run_rbl         = args.rbl         or args.all_checks
-    run_cdn         = args.cdn         or args.all_checks
-    run_mx_ports    = args.mx_ports    or args.all_checks
-    run_subdomains  = args.subdomains  or args.all_checks
-    run_dns_timing  = args.dns_timing  or args.all_checks
-    run_propagation  = args.propagation  or args.all_checks
-    run_mail_headers = getattr(args, 'mail_headers', False)
-    run_summary      = getattr(args, 'summary', False)
-    run_dnssec       = getattr(args, 'dnssec', False)      or args.all_checks
-    run_portscan     = getattr(args, 'portscan', False)    or args.all_checks
-    run_cert_chain   = getattr(args, 'cert_chain', False)  or args.all_checks
-    run_rdns         = getattr(args, 'rdns', False)        or args.all_checks
-    run_ipv6         = getattr(args, 'ipv6', False)        or args.all_checks
-    run_watch        = getattr(args, 'watch', None)
-    run_compare      = getattr(args, 'compare', None)
+    # Flags that participate in --all-checks
+    ALL_CHECK_FLAGS = [
+        "whois", "mail_audit", "axfr", "http", "ssl", "rbl", "cdn",
+        "mx_ports", "subdomains", "dns_timing", "propagation", "dnssec",
+        "portscan", "cert_chain", "rdns", "ipv6",
+    ]
+    checks = {f: getattr(args, f, False) or args.all_checks for f in ALL_CHECK_FLAGS}
+    # Standalone flags — not included in --all-checks
+    checks["mail_headers"] = args.mail_headers
+    checks["summary"]      = args.summary
+    run_watch   = args.watch
+    run_compare = args.compare
 
     if not args.json:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2127,29 +2095,29 @@ def main():
         if not args.json:
             display_results(domain, results, hide_empty=args.hide_empty)
 
-            if run_whois:       do_whois(domain)
-            if run_mail_audit:  do_mail_audit(domain, resolver, dkim_selector=args.dkim_selector)
-            if run_axfr:        do_axfr(domain, resolver)
-            if run_http:        do_http_check(domain)
-            if run_ssl:         do_ssl_check(domain, timeout=args.timeout)
-            if run_rbl:         do_rbl_check(domain, resolver)
-            if run_cdn:         do_cdn_detect(domain, resolver)
-            if run_mx_ports:    do_mx_ports(domain, resolver)
-            if run_subdomains:  do_subdomain_check(domain, timeout=args.timeout)
-            if run_dns_timing:  do_dns_timing(domain, timeout=args.timeout)
-            if run_propagation: do_propagation(domain, types, timeout=args.timeout)
-            if run_dnssec:      do_dnssec(domain, resolver)
-            if run_portscan:    do_port_scan(domain, resolver, timeout=2)
-            if run_cert_chain:  do_cert_chain(domain, timeout=args.timeout)
-            if run_rdns:        do_rdns(domain, resolver)
-            if run_ipv6:        do_ipv6(domain, resolver)
+            if checks["whois"]:       do_whois(domain)
+            if checks["mail_audit"]:  do_mail_audit(domain, resolver, dkim_selector=args.dkim_selector)
+            if checks["axfr"]:        do_axfr(domain, resolver)
+            if checks["http"]:        do_http_check(domain)
+            if checks["ssl"]:         do_ssl_check(domain, timeout=args.timeout)
+            if checks["rbl"]:         do_rbl_check(domain, resolver)
+            if checks["cdn"]:         do_cdn_detect(domain, resolver)
+            if checks["mx_ports"]:    do_mx_ports(domain, resolver)
+            if checks["subdomains"]:  do_subdomain_check(domain, timeout=args.timeout)
+            if checks["dns_timing"]:  do_dns_timing(domain, timeout=args.timeout)
+            if checks["propagation"]: do_propagation(domain, types, timeout=args.timeout)
+            if checks["dnssec"]:      do_dnssec(domain, resolver)
+            if checks["portscan"]:    do_port_scan(domain, resolver, timeout=2)
+            if checks["cert_chain"]:  do_cert_chain(domain, timeout=args.timeout)
+            if checks["rdns"]:        do_rdns(domain, resolver)
+            if checks["ipv6"]:        do_ipv6(domain, resolver)
 
     # Mail headers — run once interactively, not per-domain
-    if run_mail_headers:
+    if checks["mail_headers"]:
         do_mail_headers()
 
     # Bulk summary table
-    if run_summary and not args.json:
+    if checks["summary"] and not args.json:
         summary_rows = []
         for domain, dns_results in all_results.items():
             row = collect_summary_row(domain, dns_results, resolver, args.timeout)
