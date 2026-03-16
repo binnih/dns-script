@@ -225,7 +225,7 @@ python3 dns_lookup.py -f domains.txt --no-color > results.txt
 
 ## Notes
 
-- NXDOMAIN stops further record lookups for that domain immediately.
+- If a domain does not exist (NXDOMAIN), remaining record type lookups are skipped since there is nothing to query.
 - Propagation, RBL, subdomain, port scan, and timing checks run in parallel for speed.
 - `--resolver` accepts both IPs and hostnames (e.g. `ns1-37.azure-dns.com`).
 - `--mail-headers` reads from stdin — pipe a file or paste interactively.
