@@ -29,6 +29,9 @@ Usage:
   python3 dns_lookup.py example.com --cert-chain
   python3 dns_lookup.py example.com --rdns
   python3 dns_lookup.py example.com --ipv6
+  python3 dns_lookup.py example.com --watch 30
+  python3 dns_lookup.py --compare example.com another.com
+  python3 dns_lookup.py --init-config
 """
 
 import sys
@@ -44,6 +47,8 @@ import ipaddress
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+import os
+import configparser
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 
@@ -1614,6 +1619,265 @@ def do_ipv6(domain, resolver):
                 print(f"  {warn(f'{ip} — no PTR record')}")
 
 
+
+# ── Config file ───────────────────────────────────────────────────────────────
+
+import configparser
+import os
+
+CONFIG_PATH = os.path.expanduser("~/.dns_lookup.conf")
+
+DEFAULT_CONFIG = """\
+[defaults]
+# resolver =
+timeout = 5.0
+hide_empty = false
+no_color = false
+
+[checks]
+# Default checks to always run (comma-separated)
+# Example: always_run = whois,mail-audit,ssl
+always_run =
+
+[rbl]
+# Extra RBL lists to check (comma-separated, in addition to built-ins)
+extra_lists =
+
+[subdomains]
+# Extra subdomains to probe (comma-separated, in addition to built-ins)
+extra_subs =
+"""
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    if os.path.exists(CONFIG_PATH):
+        cfg.read(CONFIG_PATH)
+    return cfg
+
+
+def apply_config(args, cfg):
+    """Apply config file defaults — CLI flags always win."""
+    if not cfg.has_section("defaults"):
+        return
+
+    d = cfg["defaults"]
+
+    if not args.resolver and d.get("resolver"):
+        args.resolver = d.get("resolver")
+
+    if args.timeout == 5.0 and d.get("timeout"):
+        try:
+            args.timeout = float(d.get("timeout"))
+        except ValueError:
+            pass
+
+    if not args.hide_empty and d.getboolean("hide_empty", fallback=False):
+        args.hide_empty = True
+
+    if not args.no_color and d.getboolean("no_color", fallback=False):
+        args.no_color = True
+
+    # Always-run checks
+    if cfg.has_section("checks"):
+        always = cfg["checks"].get("always_run", "")
+        for flag in [f.strip() for f in always.split(",") if f.strip()]:
+            attr = flag.replace("-", "_")
+            if hasattr(args, attr) and not getattr(args, attr):
+                setattr(args, attr, True)
+
+
+def create_default_config():
+    if os.path.exists(CONFIG_PATH):
+        print(f"{C.YELLOW}Config already exists: {CONFIG_PATH}{C.RESET}")
+        return
+    with open(CONFIG_PATH, "w") as f:
+        f.write(DEFAULT_CONFIG)
+    print(f"{C.GREEN}Created default config: {CONFIG_PATH}{C.RESET}")
+    print(f"{C.DIM}Edit it to set your preferred resolver, always-on checks, etc.{C.RESET}")
+
+
+# ── Watch mode ────────────────────────────────────────────────────────────────
+
+def flatten_results(results):
+    """Return a stable string representation of DNS results for diffing."""
+    out = {}
+    for rtype, data in sorted(results.items()):
+        if data["status"] == "ok":
+            out[rtype] = sorted(v for _, v in data["records"])
+        else:
+            out[rtype] = [data["status"]]
+    return out
+
+
+def diff_results(old, new):
+    """Return (added, removed) dicts of changed record values per rtype."""
+    added   = {}
+    removed = {}
+    all_types = set(old) | set(new)
+    for rtype in sorted(all_types):
+        old_vals = set(old.get(rtype, []))
+        new_vals = set(new.get(rtype, []))
+        if old_vals != new_vals:
+            if new_vals - old_vals:
+                added[rtype]   = sorted(new_vals - old_vals)
+            if old_vals - new_vals:
+                removed[rtype] = sorted(old_vals - new_vals)
+    return added, removed
+
+
+def print_diff(added, removed):
+    if not added and not removed:
+        return False
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"\n  {C.BOLD}{C.YELLOW}── CHANGE DETECTED  {ts} {'─' * 28}{C.RESET}")
+    for rtype, vals in removed.items():
+        for v in vals:
+            print(f"  {C.RED}−  {rtype:<8}  {v}{C.RESET}")
+    for rtype, vals in added.items():
+        for v in vals:
+            print(f"  {C.GREEN}+  {rtype:<8}  {v}{C.RESET}")
+    return True
+
+
+def do_watch(domains, types, resolver, interval, args):
+    """Continuously re-query and highlight changes."""
+    print(f"\n{C.BOLD}{C.WHITE}Watch mode — interval {interval}s  (Ctrl+C to stop){C.RESET}")
+    print(f"{C.DIM}Querying: {', '.join(types)}{C.RESET}")
+
+    prev = {}
+    first_run = True
+
+    try:
+        while True:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not first_run:
+                print(f"\n{C.DIM}── poll {ts} {'─' * 40}{C.RESET}")
+
+            any_change = False
+            for domain in domains:
+                results = query_domain(domain, types, resolver)
+                flat    = flatten_results(results)
+
+                if first_run:
+                    print_domain_header(domain)
+                    display_results(domain, results, hide_empty=args.hide_empty)
+                    prev[domain] = flat
+                else:
+                    added, removed = diff_results(prev.get(domain, {}), flat)
+                    if added or removed:
+                        print(f"\n  {C.BOLD}{C.WHITE}{domain}{C.RESET}")
+                        print_diff(added, removed)
+                        prev[domain] = flat
+                        any_change = True
+
+            if not first_run and not any_change:
+                print(f"  {C.DIM}No changes{C.RESET}")
+
+            first_run = False
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print(f"\n{C.DIM}Watch stopped.{C.RESET}\n")
+
+
+# ── Comparison mode ───────────────────────────────────────────────────────────
+
+def _pad(s, width):
+    """Pad string to width, ignoring ANSI escape codes in length calculation."""
+    visible_len = len(re.sub(r"\033\[[0-9;]*m", "", s))
+    return s + " " * max(0, width - visible_len)
+
+
+def do_compare(domain_a, domain_b, types, resolver):
+    """Query two domains and print a side-by-side diff of their DNS records."""
+    # Auto-size columns to terminal width
+    # Layout: 2(indent) + 8(type) + 2(gap) + col + 2(gap) + 1(│) + 2(gap) + col + 1(margin)
+    try:
+        term_width = max(80, os.get_terminal_size().columns)
+    except OSError:
+        term_width = 120
+    overhead    = 2 + 8 + 2 + 2 + 1 + 2 + 1   # fixed characters
+    col         = max(20, (term_width - overhead) // 2)
+    total_width = 8 + 2 + col + 2 + 1 + 2 + col
+
+    # Header box
+    print(f"\n{C.BOLD}{C.CYAN}┌{'─' * (total_width + 2)}┐{C.RESET}")
+    da = domain_a[:col]
+    db = domain_b[:col]
+    left  = f"  {C.WHITE}{da}{C.CYAN}"
+    right = f"  {C.WHITE}{db}{C.CYAN}"
+    sep   = f"{C.CYAN}│{C.RESET}"
+    print(f"{C.BOLD}{C.CYAN}│{C.RESET}  {C.DIM}{'TYPE':<8}{C.RESET}  {_pad(left, col + 9)}  {sep}  {right}")
+    print(f"{C.BOLD}{C.CYAN}└{'─' * (total_width + 2)}┘{C.RESET}")
+
+    results_a = query_domain(domain_a, types, resolver)
+    results_b = query_domain(domain_b, types, resolver)
+
+    flat_a = flatten_results(results_a)
+    flat_b = flatten_results(results_b)
+
+    all_types = [t for t in types if t in set(flat_a) | set(flat_b)]
+
+    sep_line = f"  {C.DIM}{'─' * 8}  {'─' * col}  {C.CYAN}│{C.DIM}  {'─' * col}{C.RESET}"
+
+    prev_same = None
+    for rtype in all_types:
+        vals_a = flat_a.get(rtype, [])
+        vals_b = flat_b.get(rtype, [])
+
+        if not vals_a and not vals_b:
+            continue
+
+        same = set(vals_a) == set(vals_b)
+
+        # Separator line between record type groups
+        print(sep_line)
+
+        max_rows = max(len(vals_a), len(vals_b), 1)
+        for row in range(max_rows):
+            rtype_label = f"{C.BOLD}{C.YELLOW}{rtype}{C.RESET}" if row == 0 else ""
+            a_val = vals_a[row] if row < len(vals_a) else ""
+            b_val = vals_b[row] if row < len(vals_b) else ""
+
+            a_raw = a_val[:col] if a_val else "—"
+            b_raw = b_val[:col] if b_val else "—"
+
+            if same:
+                a_disp = f"{C.GREEN}{a_raw}{C.RESET}"
+                b_disp = f"{C.GREEN}{b_raw}{C.RESET}"
+            else:
+                if a_val and a_val not in set(vals_b):
+                    a_disp = f"{C.RED}{a_raw}{C.RESET}"
+                elif not a_val:
+                    a_disp = f"{C.DIM}—{C.RESET}"
+                else:
+                    a_disp = f"{C.GREEN}{a_raw}{C.RESET}"
+
+                if b_val and b_val not in set(vals_a):
+                    b_disp = f"{C.RED}{b_raw}{C.RESET}"
+                elif not b_val:
+                    b_disp = f"{C.DIM}—{C.RESET}"
+                else:
+                    b_disp = f"{C.GREEN}{b_raw}{C.RESET}"
+
+            type_col = _pad(rtype_label, 8)
+            a_col    = _pad(a_disp, col)
+            print(f"  {type_col}  {a_col}  {C.CYAN}│{C.RESET}  {b_disp}")
+
+    print(sep_line)
+
+    # Summary
+    changed = [t for t in all_types if flat_a.get(t) != flat_b.get(t)]
+    same_ct = len(all_types) - len(changed)
+    print()
+    if changed:
+        print(f"  {C.YELLOW}⚠  Differences in: {', '.join(changed)}{C.RESET}")
+    if same_ct:
+        print(f"  {C.DIM}✔  {same_ct} type(s) identical{C.RESET}")
+    print()
+
+
+
 # ── JSON output ───────────────────────────────────────────────────────────────
 
 def to_json(all_results):
@@ -1727,6 +1991,12 @@ def parse_args():
                    help="Check reverse DNS consistency (PTR forward-confirmed)")
     p.add_argument("--ipv6",           action="store_true",
                    help="Check IPv6 readiness (AAAA, MX IPv6, PTR)")
+    p.add_argument("--watch",          type=int, metavar="SECONDS",
+                   help="Re-query every N seconds and highlight changes")
+    p.add_argument("--compare",         nargs=2, metavar=("DOMAIN_A", "DOMAIN_B"),
+                   help="Compare DNS records of two domains side by side")
+    p.add_argument("--init-config",     action="store_true",
+                   help=f"Create default config file at {CONFIG_PATH}")
     return p.parse_args()
 
 
@@ -1762,6 +2032,15 @@ class Tee:
 def main():
     args = parse_args()
 
+    # Load and apply config file (CLI flags override)
+    cfg = load_config()
+    apply_config(args, cfg)
+
+    # Handle --init-config
+    if getattr(args, 'init_config', False):
+        create_default_config()
+        sys.exit(0)
+
     if args.no_color:
         no_color()
 
@@ -1774,7 +2053,7 @@ def main():
     if args.file:
         domains += load_domains_from_file(args.file)
 
-    if not domains:
+    if not domains and not getattr(args, 'compare', None) and not getattr(args, 'init_config', False):
         print(f"{C.RED}Error: provide at least one domain or use -f <file>{C.RESET}")
         sys.exit(1)
 
@@ -1804,6 +2083,8 @@ def main():
     run_cert_chain   = getattr(args, 'cert_chain', False)  or args.all_checks
     run_rdns         = getattr(args, 'rdns', False)        or args.all_checks
     run_ipv6         = getattr(args, 'ipv6', False)        or args.all_checks
+    run_watch        = getattr(args, 'watch', None)
+    run_compare      = getattr(args, 'compare', None)
 
     if not args.json:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1812,6 +2093,24 @@ def main():
         print(f"{C.DIM}Querying {len(domains)} domain(s) for: {', '.join(types)}{C.RESET}")
         if args.output:
             print(f"{C.DIM}Saving output to: {args.output}{C.RESET}")
+
+    # ── Watch mode ──
+    if run_watch:
+        do_watch(domains, types, resolver, run_watch, args)
+        if tee:
+            sys.stdout = tee.terminal
+            tee.close()
+        sys.exit(0)
+
+    # ── Compare mode ──
+    if run_compare:
+        do_compare(run_compare[0].lower().rstrip("."),
+                   run_compare[1].lower().rstrip("."),
+                   types, resolver)
+        if tee:
+            sys.stdout = tee.terminal
+            tee.close()
+        sys.exit(0)
 
     all_results = {}
     total = len(domains)
