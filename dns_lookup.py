@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+from urllib.parse import urlparse
 import os
 import configparser
 
@@ -526,6 +527,12 @@ def do_axfr(domain, resolver):
 
 # ── HTTP / HTTPS check ────────────────────────────────────────────────────────
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """HTTP handler that does not follow redirects."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def http_check_one(url, timeout=8):
     chain = []
     current = url
@@ -540,12 +547,9 @@ def http_check_one(url, timeout=8):
                 headers={"User-Agent": "dns-lookup-tool/1.0"},
                 method="HEAD"
             )
-            class NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=ctx),
-                NoRedirect()
+                _NoRedirect()
             )
             try:
                 resp = opener.open(req, timeout=timeout)
@@ -558,7 +562,6 @@ def http_check_one(url, timeout=8):
                     if not location:
                         return current, e.code, chain, None
                     if location.startswith("/"):
-                        from urllib.parse import urlparse
                         p = urlparse(current)
                         location = f"{p.scheme}://{p.netloc}{location}"
                     current = location
@@ -603,17 +606,25 @@ def do_http_check(domain):
             print(f"  {sc}{C.BOLD}{label}{C.RESET}  final={sc}{code}{C.RESET}  {C.DIM}{final}{C.RESET}")
 
 
+def ssl_get_cert(domain, timeout=8, verify=True):
+    """Open TLS connection and return (cert_dict, conn) or raise."""
+    ctx = ssl.create_default_context() if verify else ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    conn = ctx.wrap_socket(
+        socket.create_connection((domain, 443), timeout=timeout),
+        server_hostname=domain
+    )
+    return conn.getpeercert(), conn
+
+
 # ── SSL / TLS certificate check ───────────────────────────────────────────────
 
 def do_ssl_check(domain, timeout=8):
     print_section_header("SSL / TLS CERTIFICATE", C.MAGENTA)
     try:
-        ctx = ssl.create_default_context()
-        conn = ctx.wrap_socket(
-            socket.create_connection((domain, 443), timeout=timeout),
-            server_hostname=domain
-        )
-        cert = conn.getpeercert()
+        cert, conn = ssl_get_cert(domain, timeout, verify=False)
         conn.close()
 
         subject   = dict(x[0] for x in cert.get("subject", []))
@@ -733,16 +744,13 @@ def do_cdn_detect(domain, resolver):
     detected = set()
 
     # Gather NS, A, CNAME values
-    ns_vals, a_vals, cname_vals = [], [], []
-    for rtype, store in [("NS", ns_vals), ("A", a_vals), ("CNAME", cname_vals)]:
+    field_map = {}
+    for rtype in ("NS", "A", "CNAME"):
         try:
-            answers = resolver.resolve(domain, rtype)
-            for r in answers:
-                store.append(str(r).rstrip(".").lower())
+            field_map[rtype.lower()] = [str(r).rstrip(".").lower()
+                                        for r in resolver.resolve(domain, rtype)]
         except Exception:
-            pass
-
-    field_map = {"ns": ns_vals, "a": a_vals, "cname": cname_vals}
+            field_map[rtype.lower()] = []
 
     for name, field, pattern in CDN_SIGNATURES:
         values = field_map.get(field, [])
@@ -755,8 +763,8 @@ def do_cdn_detect(domain, resolver):
             print(f"  {ok(name)}")
     else:
         print(f"  {info('No known CDN/hosting provider detected')}")
-        if a_vals:
-            print(f"  {C.DIM}  A record(s): {', '.join(a_vals[:4])}{C.RESET}")
+        if field_map.get("a"):
+            print(f"  {C.DIM}  A record(s): {', '.join(field_map['a'][:4])}{C.RESET}")
 
 
 # ── MX port reachability ──────────────────────────────────────────────────────
@@ -849,6 +857,19 @@ def do_subdomain_check(domain, timeout=5.0, extra=None):
         print(f"  {C.GREEN}{fqdn:<40}{C.RESET}  {C.DIM}{rtype}  {val_str}{C.RESET}")
 
 
+def get_resolver_list(domain, timeout):
+    """Return PROPAGATION_RESOLVERS + authoritative NS resolvers for the domain."""
+    resolvers = list(PROPAGATION_RESOLVERS)
+    for ns_host in resolve_ns(domain, dns.resolver.Resolver()):
+        try:
+            ns_ip = socket.gethostbyname(ns_host)
+            short = ns_host.split(".")[0]
+            resolvers.append((f"Auth:{short}", ns_ip))
+        except Exception:
+            pass
+    return resolvers
+
+
 # ── DNS timing ────────────────────────────────────────────────────────────────
 
 def time_query(label, ns_ip, domain, rtype, timeout):
@@ -877,23 +898,7 @@ def bar(ms, max_ms=500, width=20):
 def do_dns_timing(domain, timeout=5.0):
     print_section_header("DNS TIMING", C.MAGENTA)
 
-    resolvers = list(PROPAGATION_RESOLVERS)
-
-    # Add authoritative NS
-    try:
-        sys_r = dns.resolver.Resolver()
-        sys_r.lifetime = timeout
-        ns_answers = sys_r.resolve(domain, "NS")
-        for r in ns_answers:
-            ns_host = str(r.target).rstrip(".")
-            try:
-                ns_ip = socket.gethostbyname(ns_host)
-                short = ns_host.split(".")[0]
-                resolvers.append((f"Auth:{short}", ns_ip))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    resolvers = get_resolver_list(domain, timeout)
 
     results = {}
     with ThreadPoolExecutor(max_workers=len(resolvers)) as ex:
@@ -941,22 +946,7 @@ def propagation_query(label, ns_ip, domain, rtype, timeout):
 def do_propagation(domain, types, timeout=5.0):
     print_section_header("PROPAGATION CHECK", C.MAGENTA)
 
-    resolvers = list(PROPAGATION_RESOLVERS)
-
-    try:
-        sys_r = dns.resolver.Resolver()
-        sys_r.lifetime = timeout
-        ns_answers = sys_r.resolve(domain, "NS")
-        for r in ns_answers:
-            ns_host = str(r.target).rstrip(".")
-            try:
-                ns_ip = socket.gethostbyname(ns_host)
-                short = ns_host.split(".")[0]
-                resolvers.append((f"Auth:{short}", ns_ip))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    resolvers = get_resolver_list(domain, timeout)
 
     check_types = types if types != ALL_TYPES else ["A", "AAAA", "MX", "NS"]
 
@@ -1086,19 +1076,17 @@ def do_mail_headers(raw_headers=None):
                 break
 
     # ── Originating IP check ──
-    orig_ip = None
-    for line in lines:
-        if "X-Originating-IP:" in line:
-            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
-            if m: orig_ip = m.group(1)
-    if not orig_ip:
-        # Try to extract IP from first Received header
-        for line in lines:
-            if re.match(r"^Received:", line, re.IGNORECASE):
-                m = re.search(r"\[(\d{1,3}(?:\.\d{1,3}){3})\]", line)
-                if m:
-                    orig_ip = m.group(1)
-                    break
+    IP4_RE = r"(\d{1,3}(?:\.\d{1,3}){3})"
+    orig_ip = next(
+        (re.search(IP4_RE, l).group(1) for l in lines if "X-Originating-IP:" in l
+         and re.search(IP4_RE, l)),
+        None
+    ) or next(
+        (re.search(r"\[" + IP4_RE + r"\]", l).group(1)
+         for l in lines if re.match(r"^Received:", l, re.IGNORECASE)
+         and re.search(r"\[" + IP4_RE + r"\]", l)),
+        None
+    )
 
     if orig_ip:
         print(f"\n  {C.BOLD}Originating IP: {orig_ip}{C.RESET}")
@@ -1160,39 +1148,24 @@ def print_summary_table(summary_rows):
         rbl      = row.get("rbl",      "—")
         cdn      = row.get("cdn",      "—")[:col_cdn]
 
-        # Colour ssl expiry
-        ssl_color = C.GREEN
-        if ssl_exp.startswith("ERR") or ssl_exp == "—":
-            ssl_color = C.RED
-        elif ssl_exp.endswith("d") :
+        def ssl_color(v):
+            if v.startswith("ERR") or v == "—": return C.RED
             try:
-                days = int(ssl_exp.rstrip("d"))
-                if days < 14:   ssl_color = C.RED
-                elif days < 30: ssl_color = C.YELLOW
-            except Exception:
-                pass
+                d = int(v.rstrip("d"))
+                return C.RED if d < 14 else (C.YELLOW if d < 30 else C.GREEN)
+            except ValueError:
+                return C.GREEN
 
-        # Colour http
-        http_color = C.GREEN
-        if http_st.startswith("4") or http_st.startswith("5") or http_st in ("—", "ERR"):
-            http_color = C.RED
-        elif http_st.startswith("3"):
-            http_color = C.YELLOW
-
-        # Colour dmarc
-        dmarc_color = C.GREEN
-        if dmarc in ("none", "missing", "—"):
-            dmarc_color = C.RED
-        elif dmarc == "quarantine":
-            dmarc_color = C.YELLOW
-
-        # Colour rbl
-        rbl_color = C.GREEN if rbl == "clean" else C.RED
+        http_color  = (C.RED    if http_st[0] in "45" or http_st in ("—","ERR")
+                       else C.YELLOW if http_st.startswith("3") else C.GREEN)
+        dmarc_color = (C.RED    if dmarc in ("none","missing","—")
+                       else C.YELLOW if dmarc == "quarantine" else C.GREEN)
+        rbl_color   = C.GREEN if rbl == "clean" else C.RED
 
         line = (
             f"  {C.WHITE}{domain:<{col_domain}}{C.RESET}"
             f"  {C.DIM}{a_rec:<{col_a}}{C.RESET}"
-            f"  {ssl_color}{ssl_exp:<{col_ssl}}{C.RESET}"
+            f"  {ssl_color(ssl_exp)}{ssl_exp:<{col_ssl}}{C.RESET}"
             f"  {http_color}{http_st:<{col_http}}{C.RESET}"
             f"  {dmarc_color}{dmarc:<{col_dmarc}}{C.RESET}"
             f"  {rbl_color}{rbl:<{col_rbl}}{C.RESET}"
@@ -1464,13 +1437,9 @@ def do_cert_chain(domain, timeout=8):
             print(f"  {C.DIM}  [{len(certs)-1}] Root    : {iss_cn}{C.RESET}")
 
         # Verify chain
-        verify_ctx = ssl.create_default_context()
         try:
-            vconn = verify_ctx.wrap_socket(
-                socket.create_connection((domain, 443), timeout=timeout),
-                server_hostname=domain
-            )
-            vconn.close()
+            _, vc = ssl_get_cert(domain, timeout, verify=True)
+            vc.close()
             print(f"  {ok('Certificate chain validates successfully')}")
         except ssl.SSLCertVerificationError as e:
             print(f"  {fail(f'Chain validation failed: {e}')}")
@@ -1478,22 +1447,10 @@ def do_cert_chain(domain, timeout=8):
     except FileNotFoundError:
         # openssl not available — fall back to ssl module only
         try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            conn = ctx.wrap_socket(
-                socket.create_connection((domain, 443), timeout=timeout),
-                server_hostname=domain
-            )
-            conn.close()
-
-            verify_ctx = ssl.create_default_context()
+            ssl_get_cert(domain, timeout, verify=False)[1].close()
             try:
-                vconn = verify_ctx.wrap_socket(
-                    socket.create_connection((domain, 443), timeout=timeout),
-                    server_hostname=domain
-                )
-                vconn.close()
+                _, vc = ssl_get_cert(domain, timeout, verify=True)
+                vc.close()
                 print(f"  {ok('Certificate chain validates successfully')}")
                 print(f"  {C.DIM}  Install openssl CLI for detailed chain inspection{C.RESET}")
             except ssl.SSLCertVerificationError as e:
