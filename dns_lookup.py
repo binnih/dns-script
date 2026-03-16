@@ -860,7 +860,9 @@ def do_subdomain_check(domain, timeout=5.0, extra=None):
 def get_resolver_list(domain, timeout):
     """Return PROPAGATION_RESOLVERS + authoritative NS resolvers for the domain."""
     resolvers = list(PROPAGATION_RESOLVERS)
-    for ns_host in resolve_ns(domain, dns.resolver.Resolver()):
+    r = dns.resolver.Resolver()
+    r.lifetime = timeout
+    for ns_host in resolve_ns(domain, r):
         try:
             ns_ip = socket.gethostbyname(ns_host)
             short = ns_host.split(".")[0]
@@ -1078,13 +1080,13 @@ def do_mail_headers(raw_headers=None):
     # ── Originating IP check ──
     IP4_RE = r"(\d{1,3}(?:\.\d{1,3}){3})"
     orig_ip = next(
-        (re.search(IP4_RE, l).group(1) for l in lines if "X-Originating-IP:" in l
-         and re.search(IP4_RE, l)),
+        (m.group(1) for l in lines
+         if "X-Originating-IP:" in l and (m := re.search(IP4_RE, l))),
         None
     ) or next(
-        (re.search(r"\[" + IP4_RE + r"\]", l).group(1)
-         for l in lines if re.match(r"^Received:", l, re.IGNORECASE)
-         and re.search(r"\[" + IP4_RE + r"\]", l)),
+        (m.group(1) for l in lines
+         if re.match(r"^Received:", l, re.IGNORECASE)
+         and (m := re.search(r"\[" + IP4_RE + r"\]", l))),
         None
     )
 
@@ -1139,6 +1141,14 @@ def print_summary_table(summary_rows):
     print(f"\n{C.BOLD}{C.DIM}{hdr}{C.RESET}")
     print(f"  {C.DIM}{'─' * 98}{C.RESET}")
 
+    def ssl_color(v):
+        if v.startswith("ERR") or v == "—": return C.RED
+        try:
+            d = int(v.rstrip("d"))
+            return C.RED if d < 14 else (C.YELLOW if d < 30 else C.GREEN)
+        except ValueError:
+            return C.GREEN
+
     for row in summary_rows:
         domain   = row.get("domain",   "—")[:col_domain]
         a_rec    = row.get("a",        "—")[:col_a]
@@ -1147,14 +1157,6 @@ def print_summary_table(summary_rows):
         dmarc    = row.get("dmarc",    "—")
         rbl      = row.get("rbl",      "—")
         cdn      = row.get("cdn",      "—")[:col_cdn]
-
-        def ssl_color(v):
-            if v.startswith("ERR") or v == "—": return C.RED
-            try:
-                d = int(v.rstrip("d"))
-                return C.RED if d < 14 else (C.YELLOW if d < 30 else C.GREEN)
-            except ValueError:
-                return C.GREEN
 
         http_color  = (C.RED    if http_st[0] in "45" or http_st in ("—","ERR")
                        else C.YELLOW if http_st.startswith("3") else C.GREEN)
