@@ -22,6 +22,13 @@ Usage:
   python3 dns_lookup.py example.com --dns-timing
   python3 dns_lookup.py example.com --all-checks
   python3 dns_lookup.py example.com --output results.txt
+  python3 dns_lookup.py example.com --mail-headers
+  python3 dns_lookup.py example.com --summary
+  python3 dns_lookup.py example.com --dnssec
+  python3 dns_lookup.py example.com --portscan
+  python3 dns_lookup.py example.com --cert-chain
+  python3 dns_lookup.py example.com --rdns
+  python3 dns_lookup.py example.com --ipv6
 """
 
 import sys
@@ -1004,6 +1011,609 @@ def do_propagation(domain, types, timeout=5.0):
             print(f"  {C.DIM}  consensus: {cs}{C.RESET}")
 
 
+
+# ── Email header analyser ─────────────────────────────────────────────────────
+
+def do_mail_headers(raw_headers=None):
+    """Parse raw email headers from stdin or a file and analyse the auth results."""
+    print_section_header("EMAIL HEADER ANALYSIS", C.MAGENTA)
+
+    if raw_headers is None:
+        print(f"  {C.DIM}Paste raw email headers below, then press Ctrl+D (or Ctrl+Z on Windows):{C.RESET}")
+        try:
+            raw_headers = sys.stdin.read()
+        except KeyboardInterrupt:
+            print(f"  {warn('Cancelled')}")
+            return
+
+    if not raw_headers.strip():
+        print(f"  {fail('No headers provided')}")
+        return
+
+    lines = raw_headers.splitlines()
+
+    # ── Authentication-Results ──
+    auth_blocks = []
+    current = []
+    for line in lines:
+        if re.match(r"^Authentication-Results:", line, re.IGNORECASE):
+            if current: auth_blocks.append(" ".join(current))
+            current = [line]
+        elif current and (line.startswith(" ") or line.startswith("	")):
+            current.append(line.strip())
+        elif current:
+            auth_blocks.append(" ".join(current))
+            current = []
+    if current:
+        auth_blocks.append(" ".join(current))
+
+    if auth_blocks:
+        print(f"\n  {C.BOLD}Authentication-Results{C.RESET}")
+        for block in auth_blocks:
+            # SPF
+            spf = re.search(r"spf=(\S+)", block, re.IGNORECASE)
+            if spf:
+                r = spf.group(1).lower().rstrip(";")
+                col = C.GREEN if r == "pass" else (C.YELLOW if r in ("neutral", "softfail") else C.RED)
+                print(f"  {col}SPF     {r}{C.RESET}")
+
+            # DKIM
+            for m in re.finditer(r"dkim=(\S+)[^;]*?header\.d=(\S+)", block, re.IGNORECASE):
+                r = m.group(1).lower().rstrip(";")
+                d = m.group(2).rstrip(";")
+                col = C.GREEN if r == "pass" else C.RED
+                print(f"  {col}DKIM    {r}  (d={d}){C.RESET}")
+
+            # DMARC
+            dmarc = re.search(r"dmarc=(\S+)", block, re.IGNORECASE)
+            if dmarc:
+                r = dmarc.group(1).lower().rstrip(";")
+                col = C.GREEN if r == "pass" else C.RED
+                print(f"  {col}DMARC   {r}{C.RESET}")
+    else:
+        print(f"  {C.DIM}  No Authentication-Results header found{C.RESET}")
+
+    # ── Received hops ──
+    received = [l for l in lines if re.match(r"^Received:", l, re.IGNORECASE)]
+    if received:
+        print(f"\n  {C.BOLD}Received hops ({len(received)}){C.RESET}")
+        for i, hop in enumerate(received, 1):
+            # Extract from/by
+            frm = re.search(r"from\s+(\S+)", hop, re.IGNORECASE)
+            by  = re.search(r"by\s+(\S+)",   hop, re.IGNORECASE)
+            frm_str = frm.group(1) if frm else "?"
+            by_str  = by.group(1)  if by  else "?"
+            print(f"  {C.DIM}  {i}.{C.RESET}  {frm_str}  {C.DIM}→{C.RESET}  {by_str}")
+
+    # ── Key headers ──
+    print(f"\n  {C.BOLD}Key headers{C.RESET}")
+    key_headers = ["From", "To", "Subject", "Date", "Message-ID",
+                   "Return-Path", "Reply-To", "X-Mailer", "X-Originating-IP"]
+    for h in key_headers:
+        for line in lines:
+            if line.lower().startswith(h.lower() + ":"):
+                val = line[len(h)+1:].strip()
+                if len(val) > 80: val = val[:77] + "..."
+                print(f"  {C.DIM}{h:<20}{C.RESET}  {val}")
+                break
+
+    # ── Originating IP check ──
+    orig_ip = None
+    for line in lines:
+        if "X-Originating-IP:" in line:
+            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if m: orig_ip = m.group(1)
+    if not orig_ip:
+        # Try to extract IP from first Received header
+        for line in lines:
+            if re.match(r"^Received:", line, re.IGNORECASE):
+                m = re.search(r"\[(\d{1,3}(?:\.\d{1,3}){3})\]", line)
+                if m:
+                    orig_ip = m.group(1)
+                    break
+
+    if orig_ip:
+        print(f"\n  {C.BOLD}Originating IP: {orig_ip}{C.RESET}")
+        rev = ".".join(reversed(orig_ip.split(".")))
+        # Quick RBL check on originating IP
+        listed = []
+        quick_rbls = ["zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org"]
+        for rbl in quick_rbls:
+            try:
+                dns.resolver.resolve(f"{rev}.{rbl}", "A")
+                listed.append(rbl)
+            except Exception:
+                pass
+        if listed:
+            for rbl in listed:
+                print(f"  {fail(f'Originating IP listed on {rbl}')}")
+        else:
+            print(f"  {ok(f'Originating IP clean on quick RBL check')}")
+
+
+# ── Bulk summary table ────────────────────────────────────────────────────────
+
+def print_summary_table(summary_rows):
+    """Print a one-line-per-domain summary of all check results."""
+    if not summary_rows:
+        return
+
+    print(f"\n\n{C.BOLD}{C.CYAN}{'═' * 100}{C.RESET}")
+    print(f"{C.BOLD}{C.WHITE}  BULK SUMMARY{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}{'═' * 100}{C.RESET}")
+
+    # Header
+    col_domain  = 35
+    col_a       = 16
+    col_ssl     = 12
+    col_http    = 8
+    col_dmarc   = 10
+    col_rbl     = 8
+    col_cdn     = 16
+
+    hdr = (
+        f"  {'DOMAIN':<{col_domain}}"
+        f"  {'A RECORD':<{col_a}}"
+        f"  {'SSL EXPIRY':<{col_ssl}}"
+        f"  {'HTTP':<{col_http}}"
+        f"  {'DMARC':<{col_dmarc}}"
+        f"  {'RBL':<{col_rbl}}"
+        f"  {'CDN/HOST':<{col_cdn}}"
+    )
+    print(f"\n{C.BOLD}{C.DIM}{hdr}{C.RESET}")
+    print(f"  {C.DIM}{'─' * 98}{C.RESET}")
+
+    for row in summary_rows:
+        domain   = row.get("domain",   "—")[:col_domain]
+        a_rec    = row.get("a",        "—")[:col_a]
+        ssl_exp  = row.get("ssl",      "—")
+        http_st  = row.get("http",     "—")
+        dmarc    = row.get("dmarc",    "—")
+        rbl      = row.get("rbl",      "—")
+        cdn      = row.get("cdn",      "—")[:col_cdn]
+
+        # Colour ssl expiry
+        ssl_color = C.GREEN
+        if ssl_exp.startswith("ERR") or ssl_exp == "—":
+            ssl_color = C.RED
+        elif ssl_exp.endswith("d") :
+            try:
+                days = int(ssl_exp.rstrip("d"))
+                if days < 14:   ssl_color = C.RED
+                elif days < 30: ssl_color = C.YELLOW
+            except Exception:
+                pass
+
+        # Colour http
+        http_color = C.GREEN
+        if http_st.startswith("4") or http_st.startswith("5") or http_st in ("—", "ERR"):
+            http_color = C.RED
+        elif http_st.startswith("3"):
+            http_color = C.YELLOW
+
+        # Colour dmarc
+        dmarc_color = C.GREEN
+        if dmarc in ("none", "missing", "—"):
+            dmarc_color = C.RED
+        elif dmarc == "quarantine":
+            dmarc_color = C.YELLOW
+
+        # Colour rbl
+        rbl_color = C.GREEN if rbl == "clean" else C.RED
+
+        line = (
+            f"  {C.WHITE}{domain:<{col_domain}}{C.RESET}"
+            f"  {C.DIM}{a_rec:<{col_a}}{C.RESET}"
+            f"  {ssl_color}{ssl_exp:<{col_ssl}}{C.RESET}"
+            f"  {http_color}{http_st:<{col_http}}{C.RESET}"
+            f"  {dmarc_color}{dmarc:<{col_dmarc}}{C.RESET}"
+            f"  {rbl_color}{rbl:<{col_rbl}}{C.RESET}"
+            f"  {C.DIM}{cdn:<{col_cdn}}{C.RESET}"
+        )
+        print(line)
+
+    print(f"  {C.DIM}{'─' * 98}{C.RESET}")
+    print(f"  {C.DIM}{len(summary_rows)} domain(s){C.RESET}\n")
+
+
+def collect_summary_row(domain, dns_results, resolver, timeout):
+    """Collect summary data for a domain non-interactively."""
+    row = {"domain": domain}
+
+    # A record
+    a_data = dns_results.get("A", {})
+    if a_data.get("status") == "ok" and a_data.get("records"):
+        row["a"] = a_data["records"][0][1]  # first IP
+    else:
+        row["a"] = "—"
+
+    # SSL expiry
+    try:
+        ctx = ssl.create_default_context()
+        conn = ctx.wrap_socket(
+            socket.create_connection((domain, 443), timeout=timeout),
+            server_hostname=domain
+        )
+        cert = conn.getpeercert()
+        conn.close()
+        not_after = cert.get("notAfter", "")
+        exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+        days = (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
+        row["ssl"] = f"{days}d"
+    except Exception:
+        row["ssl"] = "ERR"
+
+    # HTTP status
+    try:
+        _, code, _, err = http_check_one(f"https://{domain}", timeout=timeout)
+        row["http"] = str(code) if code else "ERR"
+    except Exception:
+        row["http"] = "ERR"
+
+    # DMARC policy
+    try:
+        answers = resolver.resolve(f"_dmarc.{domain}", "TXT")
+        for r in answers:
+            txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
+                           for p in r.strings)
+            if "DMARC1" in txt:
+                m = re.search(r"p=(\w+)", txt)
+                row["dmarc"] = m.group(1).lower() if m else "found"
+                break
+        else:
+            row["dmarc"] = "missing"
+    except Exception:
+        row["dmarc"] = "missing"
+
+    # RBL — quick check on first A IP
+    a_ip = row["a"]
+    if a_ip and a_ip != "—":
+        rev = ".".join(reversed(a_ip.split(".")))
+        listed = False
+        for rbl in RBL_LISTS[:6]:  # quick subset for summary
+            try:
+                dns.resolver.resolve(f"{rev}.{rbl}", "A")
+                listed = True
+                break
+            except Exception:
+                pass
+        row["rbl"] = "LISTED" if listed else "clean"
+    else:
+        row["rbl"] = "—"
+
+    # CDN
+    detected = set()
+    for rtype, store in [("NS", []), ("A", []), ("CNAME", [])]:
+        vals = []
+        data = dns_results.get(rtype, {})
+        if data.get("status") == "ok":
+            vals = [r[1] for r in data.get("records", [])]
+        store_map = {"NS": [], "A": [], "CNAME": []}
+        store_map[rtype] = vals
+        for name, field, pattern in CDN_SIGNATURES:
+            for v in store_map.get(field, []):
+                if re.search(pattern, str(v), re.IGNORECASE):
+                    detected.add(name)
+    row["cdn"] = ", ".join(sorted(detected)) if detected else "—"
+
+    return row
+
+
+# ── DNSSEC validation ─────────────────────────────────────────────────────────
+
+def do_dnssec(domain, resolver):
+    print_section_header("DNSSEC VALIDATION", C.MAGENTA)
+    try:
+        import dns.dnssec
+        import dns.rdatatype
+        import dns.name
+    except ImportError:
+        print(f"  {warn('dnspython DNSSEC module not available')}")
+        return
+
+    domain_name = dns.name.from_text(domain)
+
+    # Check DS record at parent
+    parent = ".".join(domain.split(".")[1:])
+    ds_found = False
+    try:
+        ds_ans = resolver.resolve(domain, "DS")
+        ds_found = True
+        print(f"  {ok(f'DS record found at parent zone')}")
+        for r in ds_ans:
+            print(f"  {C.DIM}  tag={r.key_tag}  alg={r.algorithm}  digest_type={r.digest_type}{C.RESET}")
+    except dns.resolver.NoAnswer:
+        print(f"  {fail('No DS record — DNSSEC not delegated by parent')}")
+    except dns.resolver.NXDOMAIN:
+        print(f"  {fail('NXDOMAIN — domain does not exist')}")
+    except Exception as e:
+        print(f"  {info(f'DS lookup: {e}')}")
+
+    # Check DNSKEY
+    dnskey_found = False
+    try:
+        dnskey_ans = resolver.resolve(domain, "DNSKEY")
+        dnskey_found = True
+        ksks = [r for r in dnskey_ans if r.flags & 0x0001]  # SEP bit = KSK
+        zsks = [r for r in dnskey_ans if not (r.flags & 0x0001)]
+        print(f"  {ok(f'DNSKEY records found: {len(ksks)} KSK, {len(zsks)} ZSK')}")
+    except dns.resolver.NoAnswer:
+        print(f"  {fail('No DNSKEY records — zone not signed')}")
+    except Exception as e:
+        print(f"  {info(f'DNSKEY lookup: {e}')}")
+
+    # Check RRSIG on A record
+    try:
+        rrsig_ans = resolver.resolve(domain, "RRSIG")
+        covered = [str(r.type_covered) for r in rrsig_ans]
+        print(f"  {ok(f'RRSIG found covering: {", ".join(covered[:6])}')}")
+    except Exception:
+        # RRSIG may not be directly queryable on all resolvers — try A with DO bit
+        pass
+
+    # Try AD flag via a validating resolver
+    try:
+        req = dns.message.make_query(domain, dns.rdatatype.A, want_dnssec=True)
+        req.flags |= dns.flags.AD
+        resp = dns.query.udp(req, "8.8.8.8", timeout=5)
+        ad_set = bool(resp.flags & dns.flags.AD)
+        if ad_set:
+            print(f"  {ok('AD (Authenticated Data) flag set — chain of trust validated by Google resolver')}")
+        else:
+            if ds_found and dnskey_found:
+                print(f"  {warn('AD flag not set — records exist but chain may be broken or resolver does not validate')}")
+            else:
+                print(f"  {fail('AD flag not set — DNSSEC not fully configured')}")
+    except Exception as e:
+        print(f"  {info(f'AD flag check: {e}')}")
+
+
+# ── Port scan ─────────────────────────────────────────────────────────────────
+
+COMMON_PORTS = [
+    (21,   "FTP"),
+    (22,   "SSH"),
+    (25,   "SMTP"),
+    (53,   "DNS"),
+    (80,   "HTTP"),
+    (110,  "POP3"),
+    (143,  "IMAP"),
+    (443,  "HTTPS"),
+    (465,  "SMTPS"),
+    (587,  "Submission"),
+    (993,  "IMAPS"),
+    (995,  "POP3S"),
+    (1433, "MSSQL"),
+    (3306, "MySQL/MariaDB"),
+    (3389, "RDP"),
+    (5432, "PostgreSQL"),
+    (6379, "Redis"),
+    (8080, "HTTP-alt"),
+    (8443, "HTTPS-alt"),
+    (8888, "HTTP-alt2"),
+]
+
+def scan_port(ip, port, timeout=2):
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        s.close()
+        return port, True
+    except Exception:
+        return port, False
+
+def do_port_scan(domain, resolver, timeout=2):
+    print_section_header("PORT SCAN", C.MAGENTA)
+
+    ips = []
+    try:
+        answers = resolver.resolve(domain, "A")
+        ips = [str(r) for r in answers]
+    except Exception as e:
+        print(f"  {fail(f'Could not resolve A records: {e}')}")
+        return
+
+    for ip in ips:
+        print(f"\n  {C.BOLD}IP: {ip}{C.RESET}")
+        open_ports = []
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(scan_port, ip, port, timeout): (port, label)
+                       for port, label in COMMON_PORTS}
+            for fut in as_completed(futures):
+                port, label = futures[fut]
+                _, is_open = fut.result()
+                if is_open:
+                    open_ports.append((port, label))
+
+        open_ports.sort()
+        if not open_ports:
+            print(f"  {C.DIM}  No common ports open{C.RESET}")
+        else:
+            for port, label in open_ports:
+                risk = ""
+                if port in (21, 3306, 1433, 5432, 6379, 3389):
+                    risk = f"  {C.YELLOW}⚠ potentially exposed{C.RESET}"
+                print(f"  {C.GREEN}✔  {port:<6}{C.DIM}{label}{C.RESET}{risk}")
+
+
+# ── Certificate chain check ───────────────────────────────────────────────────
+
+def do_cert_chain(domain, timeout=8):
+    print_section_header("CERTIFICATE CHAIN", C.MAGENTA)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["openssl", "s_client", "-connect", f"{domain}:443",
+             "-showcerts", "-servername", domain],
+            input=b"", capture_output=True, timeout=timeout + 2
+        )
+        output = result.stdout.decode(errors="replace")
+
+        # Count certificates in chain
+        certs = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                           output, re.DOTALL)
+        if not certs:
+            print(f"  {fail('Could not retrieve certificate chain (openssl not available or connection failed)')}")
+            return
+
+        print(f"  {info(f'Chain length: {len(certs)} certificate(s)')}")
+
+        # Parse subject/issuer of each cert using ssl module
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = ctx.wrap_socket(
+            socket.create_connection((domain, 443), timeout=timeout),
+            server_hostname=domain
+        )
+        peer = conn.getpeercert()
+        conn.close()
+
+        subject = dict(x[0] for x in peer.get("subject", []))
+        issuer  = dict(x[0] for x in peer.get("issuer",  []))
+        cn      = subject.get("commonName", "—")
+        iss_cn  = issuer.get("commonName",  issuer.get("organizationName", "—"))
+
+        print(f"  {C.DIM}  [0] Leaf     : {cn}{C.RESET}")
+        if len(certs) >= 2:
+            print(f"  {C.DIM}  [1] Intermediate(s) present{C.RESET}")
+        if len(certs) >= 3:
+            print(f"  {C.DIM}  [{len(certs)-1}] Root    : {iss_cn}{C.RESET}")
+
+        # Verify chain
+        verify_ctx = ssl.create_default_context()
+        try:
+            vconn = verify_ctx.wrap_socket(
+                socket.create_connection((domain, 443), timeout=timeout),
+                server_hostname=domain
+            )
+            vconn.close()
+            print(f"  {ok('Certificate chain validates successfully')}")
+        except ssl.SSLCertVerificationError as e:
+            print(f"  {fail(f'Chain validation failed: {e}')}")
+
+    except FileNotFoundError:
+        # openssl not available — fall back to ssl module only
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            conn = ctx.wrap_socket(
+                socket.create_connection((domain, 443), timeout=timeout),
+                server_hostname=domain
+            )
+            conn.close()
+
+            verify_ctx = ssl.create_default_context()
+            try:
+                vconn = verify_ctx.wrap_socket(
+                    socket.create_connection((domain, 443), timeout=timeout),
+                    server_hostname=domain
+                )
+                vconn.close()
+                print(f"  {ok('Certificate chain validates successfully')}")
+                print(f"  {C.DIM}  Install openssl CLI for detailed chain inspection{C.RESET}")
+            except ssl.SSLCertVerificationError as e:
+                print(f"  {fail(f'Chain validation failed: {e}')}")
+        except Exception as e:
+            print(f"  {fail(f'Chain check failed: {e}')}")
+    except Exception as e:
+        print(f"  {fail(f'Chain check failed: {e}')}")
+
+
+# ── Reverse DNS consistency ───────────────────────────────────────────────────
+
+def do_rdns(domain, resolver):
+    print_section_header("REVERSE DNS CONSISTENCY", C.MAGENTA)
+
+    ips = []
+    try:
+        answers = resolver.resolve(domain, "A")
+        ips = [str(r) for r in answers]
+    except Exception as e:
+        print(f"  {fail(f'Could not resolve A records: {e}')}")
+        return
+
+    for ip in ips:
+        print(f"\n  {C.BOLD}IP: {ip}{C.RESET}")
+        try:
+            rev = dns.reversename.from_address(ip)
+            ptr_answers = resolver.resolve(rev, "PTR")
+            for ptr in ptr_answers:
+                ptr_host = str(ptr).rstrip(".")
+                print(f"  {C.DIM}  PTR → {ptr_host}{C.RESET}")
+
+                # Forward confirm: does the PTR host resolve back to the same IP?
+                try:
+                    fwd_answers = resolver.resolve(ptr_host, "A")
+                    fwd_ips = [str(r) for r in fwd_answers]
+                    if ip in fwd_ips:
+                        print(f"  {ok(f'Forward-confirmed: {ptr_host} → {ip}')}")
+                    else:
+                        fwd_str = ", ".join(fwd_ips)
+                        print(f"  {fail(f'Mismatch: {ptr_host} resolves to {fwd_str}, not {ip}')}")
+                except Exception as e:
+                    print(f"  {warn(f'Could not forward-confirm {ptr_host}: {e}')}")
+
+                # Check if PTR matches or is related to the queried domain
+                if domain in ptr_host or ptr_host.endswith("." + domain):
+                    print(f"  {ok(f'PTR matches domain {domain}')}")
+                else:
+                    print(f"  {info(f'PTR does not match {domain} — may be hosting provider PTR (normal for shared hosting)')}")
+
+        except dns.resolver.NXDOMAIN:
+            print(f"  {fail('No PTR record — reverse DNS not configured')}")
+        except dns.resolver.NoAnswer:
+            print(f"  {fail('No PTR record — reverse DNS not configured')}")
+        except Exception as e:
+            print(f"  {fail(f'PTR lookup failed: {e}')}")
+
+
+# ── IPv6 readiness ────────────────────────────────────────────────────────────
+
+def do_ipv6(domain, resolver):
+    print_section_header("IPv6 READINESS", C.MAGENTA)
+
+    # AAAA record
+    aaaa_ips = []
+    try:
+        answers = resolver.resolve(domain, "AAAA")
+        aaaa_ips = [str(r) for r in answers]
+        print(f"  {ok(f'{len(aaaa_ips)} AAAA record(s) found')}")
+        for ip in aaaa_ips:
+            print(f"  {C.DIM}  {ip}{C.RESET}")
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        print(f"  {fail('No AAAA record — domain not reachable over IPv6')}")
+    except Exception as e:
+        print(f"  {warn(f'AAAA lookup failed: {e}')}")
+
+    # MX IPv6
+    print(f"\n  {C.BOLD}Mail stack IPv6{C.RESET}")
+    try:
+        mx_answers = resolver.resolve(domain, "MX")
+        mx_hosts = [(r.preference, str(r.exchange).rstrip(".")) for r in mx_answers]
+        for prio, host in sorted(mx_hosts):
+            try:
+                mx6 = resolver.resolve(host, "AAAA")
+                ipv6s = [str(r) for r in mx6]
+                print(f"  {ok(f'[prio {prio}] {host} has AAAA: {ipv6s[0]}')}")
+            except Exception:
+                print(f"  {warn(f'[prio {prio}] {host} — no AAAA record')}")
+    except Exception:
+        print(f"  {C.DIM}  No MX records to check{C.RESET}")
+
+    # PTR for IPv6 IPs
+    if aaaa_ips:
+        print(f"\n  {C.BOLD}IPv6 PTR records{C.RESET}")
+        for ip in aaaa_ips:
+            try:
+                rev = dns.reversename.from_address(ip)
+                ptr_answers = resolver.resolve(rev, "PTR")
+                for ptr in ptr_answers:
+                    print(f"  {ok(f'{ip} → {str(ptr).rstrip(".")}')}") 
+            except Exception:
+                print(f"  {warn(f'{ip} — no PTR record')}")
+
+
 # ── JSON output ───────────────────────────────────────────────────────────────
 
 def to_json(all_results):
@@ -1103,6 +1713,20 @@ def parse_args():
                    help="Check propagation across public resolvers + authoritative NS")
     p.add_argument("--all-checks",     action="store_true",
                    help="Run all checks")
+    p.add_argument("--mail-headers",   action="store_true",
+                   help="Analyse raw email headers (paste from stdin)")
+    p.add_argument("--summary",        action="store_true",
+                   help="Print one-line-per-domain summary table at end (best with -f)")
+    p.add_argument("--dnssec",         action="store_true",
+                   help="Validate DNSSEC chain of trust")
+    p.add_argument("--portscan",       action="store_true",
+                   help=f"Scan {len(COMMON_PORTS)} common ports on domain A record IPs")
+    p.add_argument("--cert-chain",     action="store_true",
+                   help="Verify full SSL certificate chain")
+    p.add_argument("--rdns",           action="store_true",
+                   help="Check reverse DNS consistency (PTR forward-confirmed)")
+    p.add_argument("--ipv6",           action="store_true",
+                   help="Check IPv6 readiness (AAAA, MX IPv6, PTR)")
     return p.parse_args()
 
 
@@ -1172,7 +1796,14 @@ def main():
     run_mx_ports    = args.mx_ports    or args.all_checks
     run_subdomains  = args.subdomains  or args.all_checks
     run_dns_timing  = args.dns_timing  or args.all_checks
-    run_propagation = args.propagation or args.all_checks
+    run_propagation  = args.propagation  or args.all_checks
+    run_mail_headers = getattr(args, 'mail_headers', False)
+    run_summary      = getattr(args, 'summary', False)
+    run_dnssec       = getattr(args, 'dnssec', False)      or args.all_checks
+    run_portscan     = getattr(args, 'portscan', False)    or args.all_checks
+    run_cert_chain   = getattr(args, 'cert_chain', False)  or args.all_checks
+    run_rdns         = getattr(args, 'rdns', False)        or args.all_checks
+    run_ipv6         = getattr(args, 'ipv6', False)        or args.all_checks
 
     if not args.json:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1208,6 +1839,23 @@ def main():
             if run_subdomains:  do_subdomain_check(domain, timeout=args.timeout)
             if run_dns_timing:  do_dns_timing(domain, timeout=args.timeout)
             if run_propagation: do_propagation(domain, types, timeout=args.timeout)
+            if run_dnssec:      do_dnssec(domain, resolver)
+            if run_portscan:    do_port_scan(domain, resolver, timeout=2)
+            if run_cert_chain:  do_cert_chain(domain, timeout=args.timeout)
+            if run_rdns:        do_rdns(domain, resolver)
+            if run_ipv6:        do_ipv6(domain, resolver)
+
+    # Mail headers — run once interactively, not per-domain
+    if run_mail_headers:
+        do_mail_headers()
+
+    # Bulk summary table
+    if run_summary and not args.json:
+        summary_rows = []
+        for domain, dns_results in all_results.items():
+            row = collect_summary_row(domain, dns_results, resolver, args.timeout)
+            summary_rows.append(row)
+        print_summary_table(summary_rows)
 
     if args.json:
         print(to_json(all_results))
@@ -1218,1060 +1866,6 @@ def main():
         sys.stdout = tee.terminal
         tee.close()
         print(f"{C.DIM}Output saved to: {args.output}{C.RESET}")
-
-
-if __name__ == "__main__":
-    main()#!/usr/bin/env python3
-"""
-dns_lookup.py - Comprehensive DNS record lookup tool
-
-Usage:
-  python3 dns_lookup.py example.com
-  python3 dns_lookup.py example.com another.com
-  python3 dns_lookup.py -f domains.txt
-  python3 dns_lookup.py -f domains.txt -r A MX TXT
-  python3 dns_lookup.py example.com --json
-  python3 dns_lookup.py example.com --resolver 8.8.8.8
-  python3 dns_lookup.py example.com --whois
-  python3 dns_lookup.py example.com --mail-audit
-  python3 dns_lookup.py example.com --axfr
-  python3 dns_lookup.py example.com --http
-  python3 dns_lookup.py example.com --propagation
-  python3 dns_lookup.py example.com --propagation -r A MX
-  python3 dns_lookup.py example.com --all-checks
-"""
-
-import sys
-import argparse
-import json
-import socket
-import re
-import urllib.request
-import urllib.error
-import ssl
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
-
-# ── Dependency check ──────────────────────────────────────────────────────────
-
-try:
-    import dns.resolver
-    import dns.reversename
-    import dns.exception
-    import dns.query
-    import dns.zone
-    import dns.flags
-except ImportError:
-    print("Missing dependency: dnspython")
-    print("Install with: pip3 install dnspython")
-    sys.exit(1)
-
-WHOIS_AVAILABLE = False
-try:
-    import whois as pywhois
-    WHOIS_AVAILABLE = True
-except ImportError:
-    pass
-
-# ── Colors ────────────────────────────────────────────────────────────────────
-
-class C:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    RED     = "\033[91m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    BLUE    = "\033[94m"
-    CYAN    = "\033[96m"
-    MAGENTA = "\033[95m"
-    WHITE   = "\033[97m"
-
-def no_color():
-    for attr in vars(C):
-        if not attr.startswith("_"):
-            setattr(C, attr, "")
-
-# ── Record types ──────────────────────────────────────────────────────────────
-
-ALL_TYPES = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "PTR",
-             "SRV", "CAA", "DNSKEY", "DS", "TLSA", "NAPTR", "SSHFP"]
-
-DESCRIPTIONS = {
-    "A":      "IPv4 address",
-    "AAAA":   "IPv6 address",
-    "MX":     "Mail exchange",
-    "NS":     "Name servers",
-    "TXT":    "Text / SPF / DKIM / DMARC",
-    "CNAME":  "Canonical name alias",
-    "SOA":    "Start of authority",
-    "PTR":    "Reverse DNS pointer",
-    "SRV":    "Service locator",
-    "CAA":    "Cert Authority Authorization",
-    "DNSKEY": "DNSSEC public key",
-    "DS":     "DNSSEC delegation signer",
-    "TLSA":   "TLS cert association (DANE)",
-    "NAPTR":  "Naming auth pointer (VoIP)",
-    "SSHFP":  "SSH fingerprint",
-}
-
-PROPAGATION_RESOLVERS = [
-    ("Cloudflare",   "1.1.1.1"),
-    ("Google",       "8.8.8.8"),
-    ("Quad9",        "9.9.9.9"),
-    ("OpenDNS",      "208.67.222.222"),
-    ("Comodo",       "8.26.56.26"),
-    ("Level3",       "209.244.0.3"),
-]
-
-# ── Record formatting ─────────────────────────────────────────────────────────
-
-def format_record(rtype, rdata):
-    if rtype == "MX":
-        return f"[prio {rdata.preference:>5}]  {rdata.exchange}"
-    if rtype == "SOA":
-        return (f"mname={rdata.mname}  rname={rdata.rname}  "
-                f"serial={rdata.serial}  refresh={rdata.refresh}  "
-                f"retry={rdata.retry}  expire={rdata.expire}  "
-                f"minimum={rdata.minimum}")
-    if rtype == "SRV":
-        return f"[prio {rdata.priority} w {rdata.weight}]  {rdata.target}:{rdata.port}"
-    if rtype == "CAA":
-        return f"[flags {rdata.flags}]  {rdata.tag.decode()} = {rdata.value.decode()}"
-    if rtype == "TXT":
-        parts = [p.decode(errors="replace") if isinstance(p, bytes) else p
-                 for p in rdata.strings]
-        return " ".join(parts)
-    return str(rdata)
-
-
-def lookup(domain, rtype, resolver):
-    answers = resolver.resolve(domain, rtype)
-    return [(answers.rrset.ttl, format_record(rtype, r)) for r in answers]
-
-
-# ── Pretty printer ────────────────────────────────────────────────────────────
-
-def print_domain_header(domain, index=None, total=None):
-    label = f"  {domain}  "
-    if index is not None:
-        label = f"  [{index}/{total}] {domain}  "
-    width = max(len(label) + 4, 60)
-    bar = "─" * width
-    print(f"\n{C.BOLD}{C.CYAN}┌{bar}┐{C.RESET}")
-    pad = width - len(label)
-    lpad = pad // 2
-    rpad = pad - lpad
-    print(f"{C.BOLD}{C.CYAN}│{' ' * lpad}{C.WHITE}{label}{C.CYAN}{' ' * rpad}│{C.RESET}")
-    print(f"{C.BOLD}{C.CYAN}└{bar}┘{C.RESET}")
-
-
-def print_section_header(title, color=None):
-    color = color or C.YELLOW
-    pad = max(1, 50 - len(title))
-    print(f"\n  {C.BOLD}{color}── {title} {'─' * pad}{C.RESET}")
-
-
-def print_section(rtype, records):
-    desc = DESCRIPTIONS.get(rtype, "")
-    print(f"\n  {C.BOLD}{C.YELLOW}{rtype:<8}{C.DIM}{C.WHITE}  {desc}{C.RESET}")
-    print(f"  {C.DIM}{'─' * 56}{C.RESET}")
-    for ttl, val in records:
-        ttl_str = f"{C.DIM}[TTL {ttl:>6}]{C.RESET}"
-        print(f"  {ttl_str}  {C.GREEN}{val}{C.RESET}")
-
-
-def print_no_record(rtype):
-    desc = DESCRIPTIONS.get(rtype, "")
-    print(f"\n  {C.DIM}{rtype:<8}  {desc}  —  no record{C.RESET}")
-
-
-def print_error(rtype, err):
-    print(f"\n  {C.RED}{rtype:<8}  ERROR: {err}{C.RESET}")
-
-
-def ok(msg):   return f"{C.GREEN}✔  {msg}{C.RESET}"
-def warn(msg): return f"{C.YELLOW}⚠  {msg}{C.RESET}"
-def fail(msg): return f"{C.RED}✘  {msg}{C.RESET}"
-def info(msg): return f"{C.BLUE}ℹ  {msg}{C.RESET}"
-
-
-# ── Core DNS lookup ───────────────────────────────────────────────────────────
-
-def query_domain(domain, types, resolver):
-    results = {}
-    for rtype in types:
-        try:
-            records = lookup(domain, rtype, resolver)
-            results[rtype] = {"status": "ok", "records": records}
-        except dns.resolver.NXDOMAIN:
-            results[rtype] = {"status": "nxdomain"}
-        except dns.resolver.NoAnswer:
-            results[rtype] = {"status": "noanswer"}
-        except dns.resolver.NoNameservers:
-            results[rtype] = {"status": "error", "msg": "No nameservers available"}
-        except dns.exception.Timeout:
-            results[rtype] = {"status": "error", "msg": "Query timed out"}
-        except Exception as e:
-            results[rtype] = {"status": "error", "msg": str(e)}
-    return results
-
-
-def display_results(domain, results, hide_empty=False):
-    for rtype, data in results.items():
-        status = data["status"]
-        if status == "ok":
-            print_section(rtype, data["records"])
-        elif status == "noanswer":
-            if not hide_empty:
-                print_no_record(rtype)
-        elif status == "nxdomain":
-            print(f"\n  {C.RED}NXDOMAIN — domain does not exist{C.RESET}")
-            break
-        else:
-            print_error(rtype, data.get("msg", "unknown error"))
-
-
-# ── WHOIS ─────────────────────────────────────────────────────────────────────
-
-def do_whois(domain):
-    print_section_header("WHOIS", C.MAGENTA)
-    if not WHOIS_AVAILABLE:
-        print(f"  {warn('python-whois not installed — run: pip3 install python-whois')}")
-        return
-    try:
-        w = pywhois.whois(domain)
-
-        def fmt_date(d):
-            if d is None: return "—"
-            if isinstance(d, list): d = d[0]
-            return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
-
-        registrar   = w.registrar or "—"
-        created     = fmt_date(w.creation_date)
-        updated     = fmt_date(w.updated_date)
-        expires     = fmt_date(w.expiration_date)
-        status      = w.status or "—"
-        nameservers = w.name_servers or []
-
-        exp_color = C.GREEN
-        try:
-            exp_dt = w.expiration_date
-            if isinstance(exp_dt, list): exp_dt = exp_dt[0]
-            days_left = (exp_dt - datetime.now()).days
-            if days_left < 30:   exp_color = C.RED
-            elif days_left < 90: exp_color = C.YELLOW
-            expires = f"{expires}  ({days_left} days)"
-        except Exception:
-            pass
-
-        print(f"  {C.DIM}Registrar   :{C.RESET}  {registrar}")
-        print(f"  {C.DIM}Created     :{C.RESET}  {created}")
-        print(f"  {C.DIM}Updated     :{C.RESET}  {updated}")
-        print(f"  {C.DIM}Expires     :{C.RESET}  {exp_color}{expires}{C.RESET}")
-        statuses = status if isinstance(status, list) else [status]
-        for s in statuses[:3]:
-            print(f"  {C.DIM}Status      :{C.RESET}  {s}")
-        for ns in sorted(set(str(n).lower() for n in nameservers)):
-            print(f"  {C.DIM}Nameserver  :{C.RESET}  {ns}")
-    except Exception as e:
-        print(f"  {fail(f'WHOIS failed: {e}')}")
-
-
-# ── Mail audit: SPF / DKIM / DMARC ───────────────────────────────────────────
-
-def parse_spf(txt):
-    findings = []
-    if "+all" in txt:
-        findings.append(("fail", "'+all' allows ANY server to send — no SPF protection"))
-    elif "~all" in txt:
-        findings.append(("warn", "'~all' softfail — servers may still accept spoofed mail"))
-    elif "-all" in txt:
-        findings.append(("ok",   "'-all' hard fail — only listed servers may send"))
-    elif "?all" in txt:
-        findings.append(("warn", "'?all' neutral — no guidance, treat as no SPF"))
-    else:
-        findings.append(("warn", "No 'all' mechanism — incomplete SPF record"))
-
-    for inc in re.findall(r"include:(\S+)", txt):
-        findings.append(("info", f"Includes: {inc}"))
-    for r in re.findall(r"redirect=(\S+)", txt):
-        findings.append(("info", f"Redirects to: {r}"))
-
-    lc = len(re.findall(r"\b(include|a|mx|ptr|exists|redirect)[:=]", txt))
-    if lc > 10:
-        findings.append(("warn", f"~{lc} DNS lookups — SPF limit is 10, may cause PermError"))
-    return findings
-
-
-def parse_dmarc(txt):
-    findings = []
-    p = re.search(r"\bp=(\w+)", txt)
-    policy = p.group(1).lower() if p else None
-    if policy == "none":
-        findings.append(("warn", "p=none — monitoring only, no enforcement"))
-    elif policy == "quarantine":
-        findings.append(("ok",   "p=quarantine — failing mail goes to spam"))
-    elif policy == "reject":
-        findings.append(("ok",   "p=reject — failing mail is rejected"))
-    else:
-        findings.append(("warn", f"Unknown or missing policy: {policy}"))
-
-    sp = re.search(r"\bsp=(\w+)", txt)
-    if sp:
-        findings.append(("info", f"Subdomain policy: sp={sp.group(1)}"))
-
-    pct = re.search(r"\bpct=(\d+)", txt)
-    if pct and int(pct.group(1)) < 100:
-        findings.append(("warn", f"pct={pct.group(1)} — policy only applied to {pct.group(1)}% of mail"))
-
-    rua = re.search(r"\brua=([^\s;]+)", txt)
-    if rua:
-        findings.append(("info", f"Aggregate reports → {rua.group(1)}"))
-    else:
-        findings.append(("warn", "No rua= tag — not receiving aggregate reports"))
-    return findings
-
-
-def check_dkim(domain, resolver, extra_selectors=None):
-    selectors = [
-        "default", "google", "k1", "k2", "mail", "mx",
-        "selector1", "selector2", "dkim", "smtp", "email",
-        "proofpoint", "mimecast", "s1", "s2",
-    ]
-    if extra_selectors:
-        selectors = list(extra_selectors) + [s for s in selectors if s not in extra_selectors]
-
-    found = []
-    for sel in selectors:
-        qname = f"{sel}._domainkey.{domain}"
-        try:
-            answers = resolver.resolve(qname, "TXT")
-            for r in answers:
-                txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                               for p in r.strings)
-                if "v=DKIM1" in txt or "p=" in txt:
-                    found.append((sel, txt))
-        except Exception:
-            pass
-    return found
-
-
-def do_mail_audit(domain, resolver, dkim_selector=None):
-    print_section_header("MAIL AUDIT  (SPF / DKIM / DMARC)", C.MAGENTA)
-
-    # SPF
-    print(f"\n  {C.BOLD}SPF{C.RESET}")
-    spf_records = []
-    try:
-        answers = resolver.resolve(domain, "TXT")
-        for r in answers:
-            txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                           for p in r.strings)
-            if txt.startswith("v=spf1"):
-                spf_records.append(txt)
-    except Exception:
-        pass
-
-    if not spf_records:
-        print(f"  {fail('No SPF record found')}")
-    elif len(spf_records) > 1:
-        print(f"  {fail(f'{len(spf_records)} SPF records found — must be exactly one')}")
-        for r in spf_records:
-            print(f"  {C.DIM}  {r}{C.RESET}")
-    else:
-        print(f"  {C.DIM}  {spf_records[0]}{C.RESET}")
-        for level, msg in parse_spf(spf_records[0]):
-            if level == "ok":     print(f"  {ok(msg)}")
-            elif level == "warn": print(f"  {warn(msg)}")
-            elif level == "fail": print(f"  {fail(msg)}")
-            else:                 print(f"  {info(msg)}")
-
-    # DMARC
-    print(f"\n  {C.BOLD}DMARC{C.RESET}")
-    try:
-        answers = resolver.resolve(f"_dmarc.{domain}", "TXT")
-        for r in answers:
-            txt = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else p
-                           for p in r.strings)
-            if "DMARC1" in txt:
-                print(f"  {C.DIM}  {txt}{C.RESET}")
-                for level, msg in parse_dmarc(txt):
-                    if level == "ok":     print(f"  {ok(msg)}")
-                    elif level == "warn": print(f"  {warn(msg)}")
-                    elif level == "fail": print(f"  {fail(msg)}")
-                    else:                 print(f"  {info(msg)}")
-    except dns.resolver.NXDOMAIN:
-        print(f"  {fail('No DMARC record (_dmarc.' + domain + ' NXDOMAIN)')}")
-    except dns.resolver.NoAnswer:
-        print(f"  {fail('No DMARC record found')}")
-    except Exception as e:
-        print(f"  {fail(f'DMARC lookup failed: {e}')}")
-
-    # DKIM
-    print(f"\n  {C.BOLD}DKIM  (common selectors){C.RESET}")
-    extra = [dkim_selector] if dkim_selector else None
-    dkim_found = check_dkim(domain, resolver, extra_selectors=extra)
-    if not dkim_found:
-        print(f"  {warn('No DKIM records found for common selectors')}")
-        print(f"  {C.DIM}  Use --dkim-selector SELECTOR to check a specific one{C.RESET}")
-    else:
-        for sel, txt in dkim_found:
-            display = txt if len(txt) < 100 else txt[:97] + "..."
-            print(f"  {ok(f'selector={sel}')}")
-            print(f"  {C.DIM}  {display}{C.RESET}")
-
-
-# ── Zone transfer (AXFR) ──────────────────────────────────────────────────────
-
-def do_axfr(domain, resolver):
-    print_section_header("ZONE TRANSFER (AXFR)", C.MAGENTA)
-    ns_list = []
-    try:
-        answers = resolver.resolve(domain, "NS")
-        ns_list = [str(r.target).rstrip(".") for r in answers]
-    except Exception as e:
-        print(f"  {fail(f'Could not get NS records: {e}')}")
-        return
-
-    if not ns_list:
-        print(f"  {fail('No NS records found')}")
-        return
-
-    any_success = False
-    for ns in ns_list:
-        try:
-            ns_ip = socket.gethostbyname(ns)
-            z = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=10))
-            print(f"  {C.RED}{C.BOLD}✘ ZONE TRANSFER SUCCEEDED on {ns} — security risk!{C.RESET}")
-            names = sorted(z.nodes.keys())
-            for name in names[:50]:
-                node = z[name]
-                for rdataset in node.rdatasets:
-                    for rdata in rdataset:
-                        print(f"  {C.YELLOW}  {name}.{domain}.  {rdataset.ttl}  {rdataset.rdtype}  {rdata}{C.RESET}")
-            if len(names) > 50:
-                print(f"  {C.DIM}  ... and {len(names) - 50} more records{C.RESET}")
-            any_success = True
-        except dns.exception.FormError:
-            print(f"  {ok(f'AXFR refused by {ns}')}")
-        except Exception as e:
-            err = str(e)
-            if "refused" in err.lower():
-                print(f"  {ok(f'AXFR refused by {ns}')}")
-            else:
-                print(f"  {info(f'{ns}: {err}')}")
-
-    if not any_success:
-        print(f"  {ok('Zone transfer blocked on all nameservers — good')}")
-
-
-# ── HTTP / HTTPS check ────────────────────────────────────────────────────────
-
-def http_check_one(url, timeout=8):
-    chain = []
-    current = url
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    for _ in range(10):
-        try:
-            req = urllib.request.Request(
-                current,
-                headers={"User-Agent": "dns-lookup-tool/1.0"},
-                method="HEAD"
-            )
-            class NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=ctx),
-                NoRedirect()
-            )
-            try:
-                resp = opener.open(req, timeout=timeout)
-                chain.append((current, resp.status))
-                return current, resp.status, chain, None
-            except urllib.error.HTTPError as e:
-                if e.code in (301, 302, 303, 307, 308):
-                    location = e.headers.get("Location", "")
-                    chain.append((current, e.code))
-                    if not location:
-                        return current, e.code, chain, None
-                    if location.startswith("/"):
-                        from urllib.parse import urlparse
-                        p = urlparse(current)
-                        location = f"{p.scheme}://{p.netloc}{location}"
-                    current = location
-                    continue
-                chain.append((current, e.code))
-                return current, e.code, chain, None
-        except urllib.error.URLError as e:
-            return current, None, chain, str(e.reason)
-        except Exception as e:
-            return current, None, chain, str(e)
-    return current, None, chain, "Too many redirects"
-
-
-def status_color(code):
-    if code is None:           return C.RED
-    if 200 <= code < 300:      return C.GREEN
-    if 300 <= code < 400:      return C.YELLOW
-    if code >= 400:            return C.RED
-    return C.WHITE
-
-
-def do_http_check(domain):
-    print_section_header("HTTP / HTTPS", C.MAGENTA)
-    for scheme in ("https", "http"):
-        url = f"{scheme}://{domain}"
-        final, code, chain, err = http_check_one(url)
-
-        if err and not chain:
-            print(f"  {fail(f'{scheme.upper()}  {err}')}")
-            continue
-
-        for i, (u, c) in enumerate(chain):
-            sc = status_color(c)
-            arrow = "→ " if i < len(chain) - 1 else "  "
-            print(f"  {sc}{c}{C.RESET}  {arrow}{C.DIM}{u}{C.RESET}")
-
-        if err:
-            print(f"  {fail(err)}")
-        else:
-            sc = status_color(code)
-            label = "Live" if code and 200 <= code < 400 else "Problem"
-            print(f"  {sc}{C.BOLD}{label}{C.RESET}  final={sc}{code}{C.RESET}  {C.DIM}{final}{C.RESET}")
-
-
-# ── Propagation check ─────────────────────────────────────────────────────────
-
-def propagation_query(label, ns_ip, domain, rtype, timeout):
-    r = dns.resolver.Resolver()
-    r.nameservers = [ns_ip]
-    r.lifetime = timeout
-    try:
-        answers = r.resolve(domain, rtype)
-        vals = sorted(set(format_record(rtype, rd) for rd in answers))
-        return label, vals, None
-    except dns.resolver.NXDOMAIN:
-        return label, [], "NXDOMAIN"
-    except dns.resolver.NoAnswer:
-        return label, [], "NOANSWER"
-    except dns.exception.Timeout:
-        return label, [], "TIMEOUT"
-    except Exception as e:
-        return label, [], str(e)
-
-
-def do_propagation(domain, types, timeout=5.0):
-    print_section_header("PROPAGATION CHECK", C.MAGENTA)
-
-    resolvers = list(PROPAGATION_RESOLVERS)
-
-    # Add authoritative nameservers
-    try:
-        sys_r = dns.resolver.Resolver()
-        sys_r.lifetime = timeout
-        ns_answers = sys_r.resolve(domain, "NS")
-        for r in ns_answers:
-            ns_host = str(r.target).rstrip(".")
-            try:
-                ns_ip = socket.gethostbyname(ns_host)
-                short = ns_host.split(".")[0]
-                resolvers.append((f"Auth:{short}", ns_ip))
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    check_types = types if types != ALL_TYPES else ["A", "AAAA", "MX", "NS"]
-
-    for rtype in check_types:
-        print(f"\n  {C.BOLD}{C.YELLOW}{rtype}{C.RESET}  {C.DIM}{DESCRIPTIONS.get(rtype, '')}{C.RESET}")
-        print(f"  {C.DIM}{'─' * 56}{C.RESET}")
-
-        results = {}
-        with ThreadPoolExecutor(max_workers=len(resolvers)) as ex:
-            futures = {
-                ex.submit(propagation_query, label, ip, domain, rtype, timeout): label
-                for label, ip in resolvers
-            }
-            for fut in as_completed(futures):
-                label, vals, err = fut.result()
-                results[label] = (vals, err)
-
-        answer_strs = [
-            tuple(sorted(v)) for v, e in results.values() if e is None and v
-        ]
-        consensus_vals = set(Counter(answer_strs).most_common(1)[0][0]) if answer_strs else set()
-
-        for label, ip in resolvers:
-            vals, err = results.get(label, ([], "no result"))
-            label_str = f"{label:<22}"
-            if err:
-                color = C.RED if err not in ("NOANSWER",) else C.DIM
-                print(f"  {C.DIM}{label_str}{C.RESET}  {color}{err}{C.RESET}")
-            else:
-                match = set(vals) == consensus_vals
-                indicator = f"{C.GREEN}✔{C.RESET}" if match else f"{C.RED}✘{C.RESET}"
-                val_str = ", ".join(vals) if vals else "—"
-                if len(val_str) > 70:
-                    val_str = val_str[:67] + "..."
-                col = C.GREEN if match else C.RED
-                print(f"  {C.DIM}{label_str}{C.RESET}  {indicator}  {col}{val_str}{C.RESET}")
-
-        if consensus_vals:
-            cs = ", ".join(sorted(consensus_vals))
-            if len(cs) > 100: cs = cs[:97] + "..."
-            print(f"  {C.DIM}  consensus: {cs}{C.RESET}")
-
-
-# ── JSON output ───────────────────────────────────────────────────────────────
-
-def to_json(all_results):
-    out = {}
-    for domain, results in all_results.items():
-        out[domain] = {}
-        for rtype, data in results.items():
-            if data["status"] == "ok":
-                out[domain][rtype] = [
-                    {"ttl": ttl, "value": val} for ttl, val in data["records"]
-                ]
-            else:
-                out[domain][rtype] = {"error": data["status"], "msg": data.get("msg", "")}
-    return json.dumps(out, indent=2)
-
-
-# ── Resolver builder ──────────────────────────────────────────────────────────
-
-def build_resolver(nameserver=None, timeout=5.0):
-    r = dns.resolver.Resolver()
-    r.lifetime = timeout
-    if nameserver:
-        try:
-            socket.inet_aton(nameserver)
-            resolved_ip = nameserver
-        except socket.error:
-            try:
-                resolved_ip = socket.gethostbyname(nameserver)
-            except socket.gaierror as e:
-                print(f"{C.RED}Error: could not resolve resolver hostname '{nameserver}': {e}{C.RESET}")
-                sys.exit(1)
-        r.nameservers = [resolved_ip]
-    return r
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Comprehensive DNS lookup tool",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog="""Examples:
-  dns_lookup.py example.com
-  dns_lookup.py example.com -r A MX TXT
-  dns_lookup.py -f domains.txt
-  dns_lookup.py example.com --whois
-  dns_lookup.py example.com --mail-audit
-  dns_lookup.py example.com --mail-audit --dkim-selector selector1
-  dns_lookup.py example.com --axfr
-  dns_lookup.py example.com --http
-  dns_lookup.py example.com --propagation
-  dns_lookup.py example.com --propagation -r A MX
-  dns_lookup.py example.com --all-checks
-  dns_lookup.py -f domains.txt --resolver 1.1.1.1 --json
-""")
-    p.add_argument("domains",         nargs="*", help="One or more domain names")
-    p.add_argument("-f", "--file",    help="Text file with one domain per line")
-    p.add_argument("-r", "--records", nargs="+", metavar="TYPE", default=ALL_TYPES,
-                   help=f"Record types to query (default: all)\nAvailable: {' '.join(ALL_TYPES)}")
-    p.add_argument("--resolver",      help="DNS resolver IP or hostname (default: system)")
-    p.add_argument("--timeout",       type=float, default=5.0,
-                   help="Query timeout in seconds (default: 5)")
-    p.add_argument("--hide-empty",    action="store_true",
-                   help="Don't show record types with no data")
-    p.add_argument("--no-color",      action="store_true", help="Disable color output")
-    p.add_argument("--json",          action="store_true", help="Output DNS records as JSON")
-    p.add_argument("--whois",         action="store_true",
-                   help="Show WHOIS info (requires: pip3 install python-whois)")
-    p.add_argument("--mail-audit",    action="store_true",
-                   help="Analyse SPF, DKIM, DMARC records")
-    p.add_argument("--dkim-selector", help="Extra DKIM selector to check (used with --mail-audit)")
-    p.add_argument("--axfr",          action="store_true",
-                   help="Attempt zone transfer on all NS")
-    p.add_argument("--http",          action="store_true",
-                   help="Check HTTP/HTTPS reachability and follow redirects")
-    p.add_argument("--propagation",   action="store_true",
-                   help="Check propagation across public resolvers + authoritative NS")
-    p.add_argument("--all-checks",    action="store_true",
-                   help="Run all checks: whois + mail-audit + axfr + http + propagation")
-    return p.parse_args()
-
-
-def load_domains_from_file(path):
-    try:
-        with open(path) as f:
-            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
-    except FileNotFoundError:
-        print(f"{C.RED}Error: file not found: {path}{C.RESET}")
-        sys.exit(1)
-
-
-def main():
-    args = parse_args()
-
-    if args.no_color:
-        no_color()
-
-    domains = list(args.domains)
-    if args.file:
-        domains += load_domains_from_file(args.file)
-
-    if not domains:
-        print(f"{C.RED}Error: provide at least one domain or use -f <file>{C.RESET}")
-        sys.exit(1)
-
-    types = [t.upper() for t in args.records]
-    invalid = [t for t in types if t not in ALL_TYPES]
-    if invalid:
-        print(f"{C.YELLOW}Warning: unknown record types ignored: {', '.join(invalid)}{C.RESET}")
-        types = [t for t in types if t in ALL_TYPES]
-
-    resolver = build_resolver(args.resolver, args.timeout)
-
-    run_whois       = args.whois       or args.all_checks
-    run_mail_audit  = args.mail_audit  or args.all_checks
-    run_axfr        = args.axfr        or args.all_checks
-    run_http        = args.http        or args.all_checks
-    run_propagation = args.propagation or args.all_checks
-
-    if not args.json:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ns = args.resolver or "system"
-        print(f"\n{C.BOLD}{C.WHITE}DNS Lookup  {C.DIM}{ts}  resolver={ns}{C.RESET}")
-        print(f"{C.DIM}Querying {len(domains)} domain(s) for: {', '.join(types)}{C.RESET}")
-
-    all_results = {}
-    total = len(domains)
-
-    for i, domain in enumerate(domains, 1):
-        domain = domain.lower().rstrip(".")
-
-        if not args.json:
-            print_domain_header(domain, i, total)
-
-        results = query_domain(domain, types, resolver)
-        all_results[domain] = results
-
-        if not args.json:
-            display_results(domain, results, hide_empty=args.hide_empty)
-
-            if run_whois:
-                do_whois(domain)
-            if run_mail_audit:
-                do_mail_audit(domain, resolver, dkim_selector=args.dkim_selector)
-            if run_axfr:
-                do_axfr(domain, resolver)
-            if run_http:
-                do_http_check(domain)
-            if run_propagation:
-                do_propagation(domain, types, timeout=args.timeout)
-
-    if args.json:
-        print(to_json(all_results))
-    else:
-        print(f"\n{C.DIM}Done. {total} domain(s) queried.{C.RESET}\n")
-
-
-if __name__ == "__main__":
-    main()
-#!/usr/bin/env python3
-"""
-dns_lookup.py - Comprehensive DNS record lookup tool
-Usage:
-  python3 dns_lookup.py example.com
-  python3 dns_lookup.py example.com another.com
-  python3 dns_lookup.py -f domains.txt
-  python3 dns_lookup.py -f domains.txt -r A MX TXT
-  python3 dns_lookup.py example.com --json
-  python3 dns_lookup.py example.com --resolver 8.8.8.8
-"""
-
-import sys
-import argparse
-import json
-import socket
-from datetime import datetime
-
-try:
-    import dns.resolver
-    import dns.reversename
-    import dns.exception
-except ImportError:
-    print("Missing dependency: dnspython")
-    print("Install with: pip3 install dnspython")
-    sys.exit(1)
-
-# ── Colors ────────────────────────────────────────────────────────────────────
-
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    DIM    = "\033[2m"
-    RED    = "\033[91m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-    WHITE  = "\033[97m"
-
-def no_color():
-    for attr in vars(C):
-        if not attr.startswith("_"):
-            setattr(C, attr, "")
-
-# ── Record types & handlers ───────────────────────────────────────────────────
-
-ALL_TYPES = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "PTR",
-             "SRV", "CAA", "DNSKEY", "DS", "TLSA", "NAPTR", "SSHFP"]
-
-DESCRIPTIONS = {
-    "A":      "IPv4 address",
-    "AAAA":   "IPv6 address",
-    "MX":     "Mail exchange",
-    "NS":     "Name servers",
-    "TXT":    "Text / SPF / DKIM / DMARC",
-    "CNAME":  "Canonical name alias",
-    "SOA":    "Start of authority",
-    "PTR":    "Reverse DNS pointer",
-    "SRV":    "Service locator",
-    "CAA":    "Cert Authority Authorization",
-    "DNSKEY": "DNSSEC public key",
-    "DS":     "DNSSEC delegation signer",
-    "TLSA":   "TLS cert association (DANE)",
-    "NAPTR":  "Naming auth pointer (VoIP)",
-    "SSHFP":  "SSH fingerprint",
-}
-
-def format_record(rtype, rdata):
-    """Return a human-readable string for a record."""
-    s = str(rdata)
-    if rtype == "MX":
-        return f"[prio {rdata.preference:>5}]  {rdata.exchange}"
-    if rtype == "SOA":
-        return (f"mname={rdata.mname}  rname={rdata.rname}  "
-                f"serial={rdata.serial}  refresh={rdata.refresh}  "
-                f"retry={rdata.retry}  expire={rdata.expire}  "
-                f"minimum={rdata.minimum}")
-    if rtype == "SRV":
-        return f"[prio {rdata.priority} w {rdata.weight}]  {rdata.target}:{rdata.port}"
-    if rtype == "CAA":
-        return f"[flags {rdata.flags}]  {rdata.tag.decode()} = {rdata.value.decode()}"
-    if rtype == "TXT":
-        # Join multi-string TXT records
-        parts = [p.decode(errors="replace") if isinstance(p, bytes) else p
-                 for p in rdata.strings]
-        return " ".join(parts)
-    return s
-
-
-def lookup(domain, rtype, resolver):
-    """Return list of (ttl, formatted_string) or raise dns.exception."""
-    answers = resolver.resolve(domain, rtype)
-    return [(answers.rrset.ttl, format_record(rtype, r)) for r in answers]
-
-
-# ── Pretty printer ────────────────────────────────────────────────────────────
-
-def print_domain_header(domain, index=None, total=None):
-    label = f"  {domain}  "
-    if index is not None:
-        label = f"  [{index}/{total}] {domain}  "
-    width = max(len(label) + 4, 60)
-    bar = "─" * width
-    print(f"\n{C.BOLD}{C.CYAN}┌{bar}┐{C.RESET}")
-    pad = width - len(label)
-    lpad = pad // 2
-    rpad = pad - lpad
-    print(f"{C.BOLD}{C.CYAN}│{' ' * lpad}{C.WHITE}{label}{C.CYAN}{' ' * rpad}│{C.RESET}")
-    print(f"{C.BOLD}{C.CYAN}└{bar}┘{C.RESET}")
-
-
-def print_section(rtype, records, ttl_col=True):
-    desc = DESCRIPTIONS.get(rtype, "")
-    print(f"\n  {C.BOLD}{C.YELLOW}{rtype:<8}{C.DIM}{C.WHITE}  {desc}{C.RESET}")
-    print(f"  {C.DIM}{'─' * 56}{C.RESET}")
-    for ttl, val in records:
-        ttl_str = f"{C.DIM}[TTL {ttl:>6}]{C.RESET}" if ttl_col else ""
-        print(f"  {ttl_str}  {C.GREEN}{val}{C.RESET}")
-
-
-def print_no_record(rtype):
-    desc = DESCRIPTIONS.get(rtype, "")
-    print(f"\n  {C.DIM}{rtype:<8}  {desc}  —  no record{C.RESET}")
-
-
-def print_error(rtype, err):
-    print(f"\n  {C.RED}{rtype:<8}  ERROR: {err}{C.RESET}")
-
-
-# ── Core lookup logic ─────────────────────────────────────────────────────────
-
-def query_domain(domain, types, resolver, json_mode=False):
-    results = {}
-    for rtype in types:
-        try:
-            records = lookup(domain, rtype, resolver)
-            results[rtype] = {"status": "ok", "records": records}
-        except dns.resolver.NXDOMAIN:
-            results[rtype] = {"status": "nxdomain"}
-        except dns.resolver.NoAnswer:
-            results[rtype] = {"status": "noanswer"}
-        except dns.resolver.NoNameservers:
-            results[rtype] = {"status": "error", "msg": "No nameservers available"}
-        except dns.exception.Timeout:
-            results[rtype] = {"status": "error", "msg": "Query timed out"}
-        except Exception as e:
-            results[rtype] = {"status": "error", "msg": str(e)}
-    return results
-
-
-def display_results(domain, results, hide_empty=False):
-    for rtype, data in results.items():
-        status = data["status"]
-        if status == "ok":
-            print_section(rtype, data["records"])
-        elif status == "noanswer":
-            if not hide_empty:
-                print_no_record(rtype)
-        elif status == "nxdomain":
-            print(f"\n  {C.RED}NXDOMAIN — domain does not exist{C.RESET}")
-            break
-        else:
-            print_error(rtype, data.get("msg", "unknown error"))
-
-
-# ── JSON output ───────────────────────────────────────────────────────────────
-
-def to_json(all_results):
-    out = {}
-    for domain, results in all_results.items():
-        out[domain] = {}
-        for rtype, data in results.items():
-            if data["status"] == "ok":
-                out[domain][rtype] = [
-                    {"ttl": ttl, "value": val} for ttl, val in data["records"]
-                ]
-            else:
-                out[domain][rtype] = {"error": data["status"],
-                                       "msg": data.get("msg", "")}
-    return json.dumps(out, indent=2)
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Comprehensive DNS lookup tool",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog="""Examples:
-  dns_lookup.py example.com
-  dns_lookup.py example.com another.com -r A MX TXT
-  dns_lookup.py -f domains.txt
-  dns_lookup.py -f domains.txt --resolver 1.1.1.1 --json
-  dns_lookup.py example.com --hide-empty
-""")
-    p.add_argument("domains", nargs="*", help="One or more domain names")
-    p.add_argument("-f", "--file", help="Text file with one domain per line")
-    p.add_argument("-r", "--records", nargs="+", metavar="TYPE",
-                   default=ALL_TYPES,
-                   help=f"Record types to query (default: all)\nAvailable: {' '.join(ALL_TYPES)}")
-    p.add_argument("--resolver", default=None,
-                   help="DNS resolver IP (default: system resolver)")
-    p.add_argument("--timeout", type=float, default=5.0,
-                   help="Query timeout in seconds (default: 5)")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
-    p.add_argument("--hide-empty", action="store_true",
-                   help="Don't show record types with no data")
-    p.add_argument("--no-color", action="store_true", help="Disable color output")
-    return p.parse_args()
-
-
-def load_domains_from_file(path):
-    try:
-        with open(path) as f:
-            lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        return lines
-    except FileNotFoundError:
-        print(f"{C.RED}Error: file not found: {path}{C.RESET}")
-        sys.exit(1)
-
-
-def build_resolver(nameserver=None, timeout=5.0):
-    r = dns.resolver.Resolver()
-    r.lifetime = timeout
-    if nameserver:
-        try:
-            socket.inet_aton(nameserver)
-            resolved_ip = nameserver
-        except socket.error:
-            try:
-                resolved_ip = socket.gethostbyname(nameserver)
-            except socket.gaierror as e:
-                print(f"Error: could not resolve resolver hostname '{nameserver}': {e}")
-                sys.exit(1)
-        r.nameservers = [resolved_ip]
-    return r
-
-
-def main():
-    args = parse_args()
-
-    if args.no_color:
-        no_color()
-
-    # Collect domains
-    domains = list(args.domains)
-    if args.file:
-        domains += load_domains_from_file(args.file)
-
-    if not domains:
-        print(f"{C.RED}Error: provide at least one domain or use -f <file>{C.RESET}")
-        sys.exit(1)
-
-    # Normalise record type names
-    types = [t.upper() for t in args.records]
-    invalid = [t for t in types if t not in ALL_TYPES]
-    if invalid:
-        print(f"{C.YELLOW}Warning: unknown record types ignored: {', '.join(invalid)}{C.RESET}")
-        types = [t for t in types if t in ALL_TYPES]
-
-    resolver = build_resolver(args.resolver, args.timeout)
-
-    # Print header
-    if not args.json:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ns = args.resolver or "system"
-        print(f"\n{C.BOLD}{C.WHITE}DNS Lookup  {C.DIM}{ts}  resolver={ns}{C.RESET}")
-        print(f"{C.DIM}Querying {len(domains)} domain(s) for: {', '.join(types)}{C.RESET}")
-
-    all_results = {}
-    total = len(domains)
-    for i, domain in enumerate(domains, 1):
-        domain = domain.lower().rstrip(".")
-        results = query_domain(domain, types, resolver)
-        all_results[domain] = results
-        if not args.json:
-            print_domain_header(domain, i, total)
-            display_results(domain, results, hide_empty=args.hide_empty)
-
-    if args.json:
-        print(to_json(all_results))
-    else:
-        print(f"\n{C.DIM}Done. {total} domain(s) queried.{C.RESET}\n")
 
 
 if __name__ == "__main__":
