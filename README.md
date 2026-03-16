@@ -2,7 +2,7 @@
 
 Comprehensive DNS record lookup tool for single domains or bulk lists from a file.
 
-Includes: WHOIS · Mail audit (SPF/DKIM/DMARC) · Zone transfer test · HTTP check · SSL/TLS cert · RBL/blacklist · CDN detection · MX port check · Subdomain probe · DNS timing · Propagation check · File output
+Includes: WHOIS · Mail audit (SPF/DKIM/DMARC) · Email header analyser · Zone transfer test · HTTP check · SSL/TLS cert · Certificate chain · RBL/blacklist · CDN detection · MX port check · Port scan · Subdomain probe · DNS timing · Propagation check · DNSSEC validation · Reverse DNS · IPv6 readiness · Bulk summary table · File output
 
 ---
 
@@ -61,16 +61,26 @@ client2.is
 | `--whois` | Show WHOIS info |
 | `--mail-audit` | Analyse SPF, DKIM, DMARC + deliverability score |
 | `--dkim-selector SEL` | Extra DKIM selector to check alongside common ones |
+| `--mail-headers` | Analyse raw email headers pasted from stdin |
 | `--axfr` | Attempt zone transfer on all nameservers |
 | `--http` | Check HTTP/HTTPS and follow redirect chain |
 | `--ssl` | Check SSL/TLS certificate (expiry, issuer, SANs, match) |
+| `--cert-chain` | Verify full SSL certificate chain |
 | `--rbl` | Check IPs against 12 spam blacklists |
 | `--cdn` | Detect CDN or hosting provider |
 | `--mx-ports` | Check MX hosts for open ports 25/465/587 |
+| `--portscan` | Scan 20 common ports on domain A record IPs |
 | `--subdomains` | Probe 50+ common subdomains for A/AAAA/CNAME |
 | `--dns-timing` | Measure query response time across resolvers |
 | `--propagation` | Check propagation across public + authoritative resolvers |
+| `--dnssec` | Validate DNSSEC chain of trust |
+| `--rdns` | Check reverse DNS consistency (PTR + forward confirmation) |
+| `--ipv6` | Check IPv6 readiness (AAAA, MX IPv6, PTR) |
+| `--summary` | Print one-line-per-domain summary table at end |
 | `--all-checks` | Run all checks |
+| `--watch N` | Re-query every N seconds, highlight changes |
+| `--compare A B` | Compare DNS records of two domains side by side |
+| `--init-config` | Create default config file at `~/.dns_lookup.conf` |
 
 ---
 
@@ -109,6 +119,9 @@ Registrar, created/updated/expiry dates, domain status, nameservers. Expiry colo
 **DKIM** — probes 15 common selectors automatically.  
 **Deliverability score** — combined 0–3 rating (Poor / Weak / Fair / Good).
 
+### Email header analyser (`--mail-headers`)
+Paste raw email headers from stdin. Parses `Authentication-Results` for SPF/DKIM/DMARC pass/fail, lists every received hop, extracts key headers (From, Return-Path, X-Originating-IP, etc.), and does a quick RBL check on the originating IP. Useful when a client reports mail going to spam.
+
 ### Zone transfer (`--axfr`)
 Attempts AXFR against every NS. Flags a successful transfer as a security risk and dumps records. Refused = pass.
 
@@ -117,6 +130,9 @@ HEAD request to both `https://` and `http://`, manually follows the full redirec
 
 ### SSL / TLS (`--ssl`)
 Connects to port 443 and inspects the certificate: expiry (colour-coded), issuer, SANs, domain match check, self-signed detection.
+
+### Certificate chain (`--cert-chain`)
+Verifies the full certificate chain (leaf + intermediates + root). Catches misconfigured servers that work in browsers but break on some mail clients or APIs. Uses `openssl` CLI if available, falls back to the Python `ssl` module.
 
 ### Blacklist / RBL (`--rbl`)
 Checks the domain's A record IPs in parallel against 12 lists including Spamhaus ZEN, SpamCop, Barracuda, SORBS, and CBL.
@@ -127,6 +143,9 @@ Identifies provider from NS, A, and CNAME patterns. Covers Cloudflare, AWS Cloud
 ### MX port check (`--mx-ports`)
 Resolves each MX host and checks ports 25 (SMTP), 465 (SMTPS), and 587 (Submission) for connectivity.
 
+### Port scan (`--portscan`)
+Checks 20 common ports on each A record IP: 21/FTP, 22/SSH, 25/SMTP, 53/DNS, 80/HTTP, 443/HTTPS, 3306/MySQL, 3389/RDP, 5432/PostgreSQL, 6379/Redis, and more. Flags potentially exposed sensitive ports.
+
 ### Subdomain probe (`--subdomains`)
 Probes 50+ common subdomains (`www`, `mail`, `api`, `vpn`, `admin`, `staging`, `git`, `grafana`, etc.) in parallel for A/AAAA/CNAME records.
 
@@ -135,6 +154,18 @@ Measures A record query response time across 6 public resolvers plus authoritati
 
 ### Propagation check (`--propagation`)
 Queries 6 public resolvers + authoritative NS in parallel, compares answers to consensus. Mismatches highlighted in red. Defaults to A/AAAA/MX/NS; use `-r` to specify types.
+
+### DNSSEC validation (`--dnssec`)
+Checks for DS record at parent zone, DNSKEY records (KSK/ZSK count), RRSIG coverage, and queries Google's validating resolver for the AD (Authenticated Data) flag to confirm the full chain of trust.
+
+### Reverse DNS consistency (`--rdns`)
+For each A record IP: looks up the PTR record, forward-confirms the PTR hostname resolves back to the same IP, and checks whether the PTR matches the queried domain. Mismatches are a common cause of mail rejection.
+
+### IPv6 readiness (`--ipv6`)
+Checks for AAAA records on the domain, AAAA records on each MX host, and PTR records for all IPv6 addresses.
+
+### Bulk summary table (`--summary`)
+After processing all domains, prints a compact one-line-per-domain table showing: A record, SSL days remaining, HTTP status, DMARC policy, RBL status, and CDN/hosting provider. Colour-coded for quick scanning. Most useful with `-f domains.txt`.
 
 ---
 
@@ -147,11 +178,8 @@ python3 dns_lookup.py example.com
 # Multiple domains, mail records only
 python3 dns_lookup.py example.com another.com -r MX TXT NS
 
-# Bulk lookup, hide empty types
-python3 dns_lookup.py -f domains.txt --hide-empty
-
-# Use a named nameserver as resolver
-python3 dns_lookup.py example.com --resolver ns1-37.azure-dns.com
+# Bulk lookup with summary table
+python3 dns_lookup.py -f domains.txt --summary --hide-empty
 
 # Full audit, save to file
 python3 dns_lookup.py example.com --all-checks --output report.txt
@@ -159,26 +187,32 @@ python3 dns_lookup.py example.com --all-checks --output report.txt
 # Mail audit with a known DKIM selector
 python3 dns_lookup.py example.com --mail-audit --dkim-selector selector1
 
-# Check SSL cert
-python3 dns_lookup.py example.com --ssl
+# Analyse email headers (paste when prompted)
+python3 dns_lookup.py example.com --mail-headers
+
+# Check SSL cert and full chain
+python3 dns_lookup.py example.com --ssl --cert-chain
 
 # Check if IPs are blacklisted
 python3 dns_lookup.py example.com --rbl
 
-# Detect CDN/hosting
-python3 dns_lookup.py example.com --cdn
+# Port scan
+python3 dns_lookup.py example.com --portscan
 
-# Check MX port availability
-python3 dns_lookup.py example.com --mx-ports
+# DNSSEC validation
+python3 dns_lookup.py example.com --dnssec
 
-# Probe for subdomains
-python3 dns_lookup.py example.com --subdomains
+# Reverse DNS check
+python3 dns_lookup.py example.com --rdns
 
-# DNS response time across resolvers
-python3 dns_lookup.py example.com --dns-timing
+# IPv6 readiness
+python3 dns_lookup.py example.com --ipv6
 
 # Propagation check for A and MX only
 python3 dns_lookup.py example.com --propagation -r A MX
+
+# Use a named nameserver as resolver
+python3 dns_lookup.py example.com --resolver ns1-37.azure-dns.com
 
 # JSON output
 python3 dns_lookup.py -f domains.txt --json | jq '.[].MX'
@@ -192,5 +226,47 @@ python3 dns_lookup.py -f domains.txt --no-color > results.txt
 ## Notes
 
 - NXDOMAIN stops further record lookups for that domain immediately.
-- Propagation, RBL, subdomain, and timing checks run in parallel for speed.
+- Propagation, RBL, subdomain, port scan, and timing checks run in parallel for speed.
 - `--resolver` accepts both IPs and hostnames (e.g. `ns1-37.azure-dns.com`).
+- `--mail-headers` reads from stdin — pipe a file or paste interactively.
+- `--cert-chain` uses `openssl` CLI if installed; falls back to Python `ssl` module.
+
+### Config file (`--init-config`)
+Creates `~/.dns_lookup.conf` with commented defaults. Edit it to set a preferred resolver, default timeout, always-on checks, and extra RBL/subdomain lists. CLI flags always override config values.
+
+```ini
+[defaults]
+resolver = 1.1.1.1
+timeout = 5.0
+hide_empty = false
+
+[checks]
+# Always run these checks without needing to pass the flag every time
+always_run = whois,ssl,mail-audit
+
+[rbl]
+extra_lists =
+
+[subdomains]
+extra_subs = intranet,erp,crm
+```
+
+```bash
+python3 dns_lookup.py --init-config
+```
+
+### Watch mode (`--watch N`)
+Re-queries every N seconds and prints only what changed — added values in green, removed in red. First run shows full results; subsequent runs show diffs only. Hit Ctrl+C to stop.
+
+```bash
+python3 dns_lookup.py example.com --watch 30
+python3 dns_lookup.py example.com --watch 60 -r A MX
+```
+
+### Compare mode (`--compare domain_a domain_b`)
+Queries both domains and prints a side-by-side table of all record types. Identical values are dimmed; differences are highlighted with red (only in A) / green (only in B). A summary line shows which types differ.
+
+```bash
+python3 dns_lookup.py --compare example.com staging.example.com
+python3 dns_lookup.py --compare old-domain.com new-domain.com -r A MX NS TXT
+```
