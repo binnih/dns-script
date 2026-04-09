@@ -860,9 +860,7 @@ def do_subdomain_check(domain, timeout=5.0, extra=None):
 def get_resolver_list(domain, timeout):
     """Return PROPAGATION_RESOLVERS + authoritative NS resolvers for the domain."""
     resolvers = list(PROPAGATION_RESOLVERS)
-    r = dns.resolver.Resolver()
-    r.lifetime = timeout
-    for ns_host in resolve_ns(domain, r):
+    for ns_host in resolve_ns(domain, dns.resolver.Resolver()):
         try:
             ns_ip = socket.gethostbyname(ns_host)
             short = ns_host.split(".")[0]
@@ -1080,13 +1078,13 @@ def do_mail_headers(raw_headers=None):
     # ── Originating IP check ──
     IP4_RE = r"(\d{1,3}(?:\.\d{1,3}){3})"
     orig_ip = next(
-        (m.group(1) for l in lines
-         if "X-Originating-IP:" in l and (m := re.search(IP4_RE, l))),
+        (re.search(IP4_RE, l).group(1) for l in lines if "X-Originating-IP:" in l
+         and re.search(IP4_RE, l)),
         None
     ) or next(
-        (m.group(1) for l in lines
-         if re.match(r"^Received:", l, re.IGNORECASE)
-         and (m := re.search(r"\[" + IP4_RE + r"\]", l))),
+        (re.search(r"\[" + IP4_RE + r"\]", l).group(1)
+         for l in lines if re.match(r"^Received:", l, re.IGNORECASE)
+         and re.search(r"\[" + IP4_RE + r"\]", l)),
         None
     )
 
@@ -1118,7 +1116,7 @@ def print_summary_table(summary_rows):
 
     print(f"\n\n{C.BOLD}{C.CYAN}{'═' * 100}{C.RESET}")
     print(f"{C.BOLD}{C.WHITE}  BULK SUMMARY{C.RESET}")
-    print(f"{C.BOLD}{C.CYAN}{'═' * 100}{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}{'═' * 114}{C.RESET}")
 
     # Header
     col_domain  = 35
@@ -1126,6 +1124,7 @@ def print_summary_table(summary_rows):
     col_ssl     = 12
     col_http    = 8
     col_dmarc   = 10
+    col_dkim    = 12
     col_rbl     = 8
     col_cdn     = 16
 
@@ -1135,19 +1134,12 @@ def print_summary_table(summary_rows):
         f"  {'SSL EXPIRY':<{col_ssl}}"
         f"  {'HTTP':<{col_http}}"
         f"  {'DMARC':<{col_dmarc}}"
+        f"  {'DKIM':<{col_dkim}}"
         f"  {'RBL':<{col_rbl}}"
         f"  {'CDN/HOST':<{col_cdn}}"
     )
     print(f"\n{C.BOLD}{C.DIM}{hdr}{C.RESET}")
-    print(f"  {C.DIM}{'─' * 98}{C.RESET}")
-
-    def ssl_color(v):
-        if v.startswith("ERR") or v == "—": return C.RED
-        try:
-            d = int(v.rstrip("d"))
-            return C.RED if d < 14 else (C.YELLOW if d < 30 else C.GREEN)
-        except ValueError:
-            return C.GREEN
+    print(f"  {C.DIM}{'─' * 112}{C.RESET}")
 
     for row in summary_rows:
         domain   = row.get("domain",   "—")[:col_domain]
@@ -1155,13 +1147,23 @@ def print_summary_table(summary_rows):
         ssl_exp  = row.get("ssl",      "—")
         http_st  = row.get("http",     "—")
         dmarc    = row.get("dmarc",    "—")
+        dkim     = row.get("dkim",     "—")[:col_dkim]
         rbl      = row.get("rbl",      "—")
         cdn      = row.get("cdn",      "—")[:col_cdn]
+
+        def ssl_color(v):
+            if v.startswith("ERR") or v == "—": return C.RED
+            try:
+                d = int(v.rstrip("d"))
+                return C.RED if d < 14 else (C.YELLOW if d < 30 else C.GREEN)
+            except ValueError:
+                return C.GREEN
 
         http_color  = (C.RED    if http_st[0] in "45" or http_st in ("—","ERR")
                        else C.YELLOW if http_st.startswith("3") else C.GREEN)
         dmarc_color = (C.RED    if dmarc in ("none","missing","—")
                        else C.YELLOW if dmarc == "quarantine" else C.GREEN)
+        dkim_color  = C.GREEN if dkim != "—" else C.RED
         rbl_color   = C.GREEN if rbl == "clean" else C.RED
 
         line = (
@@ -1170,12 +1172,13 @@ def print_summary_table(summary_rows):
             f"  {ssl_color(ssl_exp)}{ssl_exp:<{col_ssl}}{C.RESET}"
             f"  {http_color}{http_st:<{col_http}}{C.RESET}"
             f"  {dmarc_color}{dmarc:<{col_dmarc}}{C.RESET}"
+            f"  {dkim_color}{dkim:<{col_dkim}}{C.RESET}"
             f"  {rbl_color}{rbl:<{col_rbl}}{C.RESET}"
             f"  {C.DIM}{cdn:<{col_cdn}}{C.RESET}"
         )
         print(line)
 
-    print(f"  {C.DIM}{'─' * 98}{C.RESET}")
+    print(f"  {C.DIM}{'─' * 112}{C.RESET}")
     print(f"  {C.DIM}{len(summary_rows)} domain(s){C.RESET}\n")
 
 
@@ -1226,6 +1229,13 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
             row["dmarc"] = "missing"
     except Exception:
         row["dmarc"] = "missing"
+
+    # DKIM — probe common selectors
+    dkim_found = check_dkim(domain, resolver)
+    if dkim_found:
+        row["dkim"] = dkim_found[0][0]  # first matched selector name
+    else:
+        row["dkim"] = "—"
 
     # RBL — quick check on first A IP
     a_ip = row["a"]
