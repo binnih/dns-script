@@ -70,7 +70,7 @@ client2.is
 | `--mail-headers` | Analyse raw email headers pasted from stdin |
 | `--axfr` | Attempt zone transfer on all nameservers |
 | `--http` | Check HTTP/HTTPS and follow redirect chain |
-| `--ssl` | Check SSL/TLS certificate (expiry, issuer, SANs, match) |
+| `--ssl` | Check SSL/TLS certificate (protocol, expiry, issuer, SANs, match, trust) |
 | `--cert-chain` | Verify full SSL certificate chain |
 | `--rbl` | Check IPs against 12 spam blacklists |
 | `--cdn` | Detect CDN or hosting provider |
@@ -145,7 +145,7 @@ Attempts AXFR against every NS. A successful transfer is flagged as a security r
 HEAD request to both `https://` and `http://`, manually follows the full redirect chain, prints each hop with its status code.
 
 ### SSL / TLS (`--ssl`)
-Connects to port 443 and inspects the certificate: expiry (colour-coded), issuer, SANs, domain match check, self-signed detection.
+Connects to port 443 and inspects the certificate: negotiated TLS protocol version, expiry (colour-coded), issuer, SANs, domain-match check, and self-signed detection. Also reports whether the certificate is trusted by validating the chain (flagging expired, self-signed, or hostname-mismatch certs).
 
 ### Certificate chain (`--cert-chain`)
 Verifies the full certificate chain (leaf + intermediates + root). Catches misconfigured servers that work in browsers but break on some mail clients or APIs. Uses `openssl` CLI if available, falls back to the Python `ssl` module.
