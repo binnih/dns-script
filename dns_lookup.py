@@ -431,6 +431,7 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
     except Exception:
         pass
 
+    spf_findings = parse_spf(spf_records[0]) if len(spf_records) == 1 else []
     if not spf_records:
         print(f"  {fail('No SPF record found')}")
     elif len(spf_records) > 1:
@@ -439,10 +440,10 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
             print(f"  {C.DIM}  {r}{C.RESET}")
     else:
         print(f"  {C.DIM}  {spf_records[0]}{C.RESET}")
-        print_findings(parse_spf(spf_records[0]))
+        print_findings(spf_findings)
 
     # Mail deliverability score
-    spf_score  = 1 if len(spf_records) == 1 and any(l == "ok"   for l, _ in (parse_spf(spf_records[0]) if spf_records else [])) else 0
+    spf_score  = 1 if any(l == "ok" for l, _ in spf_findings) else 0
     dmarc_score = 0
     dkim_score  = 0
 
@@ -606,17 +607,48 @@ def do_http_check(domain):
             print(f"  {sc}{C.BOLD}{label}{C.RESET}  final={sc}{code}{C.RESET}  {C.DIM}{final}{C.RESET}")
 
 
+def _decode_der_cert(der_bytes):
+    """Parse a DER-encoded cert into the dict shape ssl.getpeercert() returns."""
+    import tempfile
+    pem = ssl.DER_cert_to_PEM_cert(der_bytes)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write(pem)
+            tmp = f.name
+        return ssl._ssl._test_decode_cert(tmp)
+    finally:
+        if tmp:
+            os.remove(tmp)
+
+
 def ssl_get_cert(domain, timeout=8, verify=True):
-    """Open TLS connection and return (cert_dict, conn) or raise."""
-    ctx = ssl.create_default_context() if verify else ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    if not verify:
+    """Open a TLS connection and return (cert_dict, protocol).
+
+    Always returns a populated certificate dict. When verify=False, the
+    handshake skips validation and getpeercert() comes back empty, so the
+    certificate is recovered from its DER form instead. Raises on connection
+    failure, or on validation failure when verify=True.
+    """
+    if verify:
+        ctx = ssl.create_default_context()
+    else:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     conn = ctx.wrap_socket(
         socket.create_connection((domain, 443), timeout=timeout),
         server_hostname=domain
     )
-    return conn.getpeercert(), conn
+    try:
+        protocol = conn.version()
+        cert = conn.getpeercert()
+        if not cert:
+            der = conn.getpeercert(binary_form=True)
+            cert = _decode_der_cert(der) if der else {}
+    finally:
+        conn.close()
+    return cert, protocol
 
 
 # ── SSL / TLS certificate check ───────────────────────────────────────────────
@@ -624,15 +656,16 @@ def ssl_get_cert(domain, timeout=8, verify=True):
 def do_ssl_check(domain, timeout=8):
     print_section_header("SSL / TLS CERTIFICATE", C.MAGENTA)
     try:
-        cert, conn = ssl_get_cert(domain, timeout, verify=False)
-        conn.close()
+        cert, protocol = ssl_get_cert(domain, timeout, verify=False)
+        if not cert:
+            print(f"  {fail('Could not read certificate')}")
+            return
 
         subject   = dict(x[0] for x in cert.get("subject", []))
         issuer    = dict(x[0] for x in cert.get("issuer", []))
         not_before = cert.get("notBefore", "")
         not_after  = cert.get("notAfter",  "")
         sans       = [v for t, v in cert.get("subjectAltName", []) if t == "DNS"]
-        protocol   = conn.version() if hasattr(conn, "version") else "unknown"
 
         cn       = subject.get("commonName", "—")
         issuer_o = issuer.get("organizationName", issuer.get("commonName", "—"))
@@ -652,10 +685,11 @@ def do_ssl_check(domain, timeout=8):
         domain_match = any(
             re.fullmatch(re.escape(s).replace(r"\*", "[^.]+"), domain)
             for s in sans
-        ) or cn == domain or cn.startswith("*.") and domain.endswith(cn[1:])
+        ) or cn == domain or (cn.startswith("*.") and domain.endswith(cn[1:]))
 
         print(f"  {C.DIM}Common Name :{C.RESET}  {cn}")
         print(f"  {C.DIM}Issuer      :{C.RESET}  {issuer_o}")
+        print(f"  {C.DIM}Protocol    :{C.RESET}  {protocol or 'unknown'}")
         print(f"  {C.DIM}Valid from  :{C.RESET}  {not_before}")
         exp_str = not_after
         if days_left is not None:
@@ -674,8 +708,16 @@ def do_ssl_check(domain, timeout=8):
         else:
             print(f"  {ok(f'Signed by: {issuer_o}')}")
 
-    except ssl.SSLCertVerificationError as e:
-        print(f"  {fail(f'Certificate verification failed: {e}')}")
+        # Trust / chain validation (separate verifying handshake)
+        try:
+            ssl_get_cert(domain, timeout, verify=True)
+            print(f"  {ok('Certificate is trusted (chain validates)')}")
+        except ssl.SSLCertVerificationError as e:
+            reason = getattr(e, "verify_message", None) or str(e)
+            print(f"  {fail(f'Not trusted: {reason}')}")
+        except Exception:
+            pass
+
     except ConnectionRefusedError:
         print(f"  {fail('Port 443 refused — no HTTPS listener')}")
     except socket.timeout:
@@ -1279,14 +1321,12 @@ def do_dnssec(domain, resolver):
         import dns.dnssec
         import dns.rdatatype
         import dns.name
+        import dns.message
     except ImportError:
         print(f"  {warn('dnspython DNSSEC module not available')}")
         return
 
-    domain_name = dns.name.from_text(domain)
-
     # Check DS record at parent
-    parent = ".".join(domain.split(".")[1:])
     ds_found = False
     try:
         ds_ans = resolver.resolve(domain, "DS")
@@ -1427,17 +1467,8 @@ def do_cert_chain(domain, timeout=8):
 
         print(f"  {info(f'Chain length: {len(certs)} certificate(s)')}")
 
-        # Parse subject/issuer of each cert using ssl module
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = ctx.wrap_socket(
-            socket.create_connection((domain, 443), timeout=timeout),
-            server_hostname=domain
-        )
-        peer = conn.getpeercert()
-        conn.close()
-
+        # Parse subject/issuer of the leaf cert
+        peer, _ = ssl_get_cert(domain, timeout, verify=False)
         subject = dict(x[0] for x in peer.get("subject", []))
         issuer  = dict(x[0] for x in peer.get("issuer",  []))
         cn      = subject.get("commonName", "—")
@@ -1451,8 +1482,7 @@ def do_cert_chain(domain, timeout=8):
 
         # Verify chain
         try:
-            _, vc = ssl_get_cert(domain, timeout, verify=True)
-            vc.close()
+            ssl_get_cert(domain, timeout, verify=True)
             print(f"  {ok('Certificate chain validates successfully')}")
         except ssl.SSLCertVerificationError as e:
             print(f"  {fail(f'Chain validation failed: {e}')}")
@@ -1460,10 +1490,9 @@ def do_cert_chain(domain, timeout=8):
     except FileNotFoundError:
         # openssl not available — fall back to ssl module only
         try:
-            ssl_get_cert(domain, timeout, verify=False)[1].close()
+            ssl_get_cert(domain, timeout, verify=False)  # connectivity check
             try:
-                _, vc = ssl_get_cert(domain, timeout, verify=True)
-                vc.close()
+                ssl_get_cert(domain, timeout, verify=True)
                 print(f"  {ok('Certificate chain validates successfully')}")
                 print(f"  {C.DIM}  Install openssl CLI for detailed chain inspection{C.RESET}")
             except ssl.SSLCertVerificationError as e:
