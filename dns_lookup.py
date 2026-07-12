@@ -741,8 +741,13 @@ def do_ssl_check(domain, timeout=8):
 def rbl_check_one(ip_rev, rbl):
     query = f"{ip_rev}.{rbl}"
     try:
-        dns.resolver.resolve(query, "A")
-        return rbl, True, None
+        answers = [str(r) for r in dns.resolver.resolve(query, "A")]
+        # Real listings are encoded in 127.0.0.x. Codes like 127.255.255.254
+        # mean the query was blocked/rate-limited (e.g. Spamhaus refusing a
+        # public resolver) — that's an error, not a listing.
+        if any(a.startswith("127.0.0.") for a in answers):
+            return rbl, True, None
+        return rbl, None, f"blocked/non-listing response ({', '.join(answers)})"
     except dns.resolver.NXDOMAIN:
         return rbl, False, None
     except Exception as e:

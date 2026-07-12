@@ -151,7 +151,7 @@ Connects to port 443 and inspects the certificate: negotiated TLS protocol versi
 Verifies the full certificate chain (leaf + intermediates + root). Catches misconfigured servers that work in browsers but break on some mail clients or APIs. Uses `openssl` CLI if available, falls back to the Python `ssl` module.
 
 ### Blacklist / RBL (`--rbl`)
-Checks the domain's A record IPs in parallel against 12 lists including Spamhaus ZEN, SpamCop, Barracuda, SORBS, and CBL.
+Checks the domain's A record IPs in parallel against 12 lists including Spamhaus ZEN, SpamCop, Barracuda, SORBS, and CBL. Only genuine listing responses (`127.0.0.x`) count as a hit; blocked or rate-limited replies are reported as "could not be checked" rather than false positives. Note that Spamhaus and some other lists refuse queries from large public resolvers — for accurate results, point `--resolver` at a private/local resolver.
 
 ### CDN / hosting detection (`--cdn`)
 Identifies provider from NS, A, and CNAME patterns. Covers Cloudflare, AWS CloudFront, Azure, Fastly, Akamai, Google Cloud, Vercel, Netlify, GitHub Pages, Bunny CDN, and Sucuri.
