@@ -1318,7 +1318,8 @@ def do_dnssec(domain, resolver):
     try:
         rrsig_ans = resolver.resolve(domain, "RRSIG")
         covered = [str(r.type_covered) for r in rrsig_ans]
-        print(f"  {ok(f'RRSIG found covering: {", ".join(covered[:6])}')}")
+        covered_str = ", ".join(covered[:6])
+        print(f"  {ok(f'RRSIG found covering: {covered_str}')}")
     except Exception:
         # RRSIG may not be directly queryable on all resolvers — try A with DO bit
         pass
@@ -1559,7 +1560,8 @@ def do_ipv6(domain, resolver):
                 rev = dns.reversename.from_address(ip)
                 ptr_answers = resolver.resolve(rev, "PTR")
                 for ptr in ptr_answers:
-                    print(f"  {ok(f'{ip} → {str(ptr).rstrip(".")}')}") 
+                    ptr_name = str(ptr).rstrip(".")
+                    print(f"  {ok(f'{ip} → {ptr_name}')}")
             except Exception:
                 print(f"  {warn(f'{ip} — no PTR record')}")
 
