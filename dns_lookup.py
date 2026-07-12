@@ -2018,7 +2018,7 @@ def main():
     if args.file:
         domains += load_domains_from_file(args.file)
 
-    if not domains and not args.compare and not args.init_config:
+    if not domains and not args.compare and not args.init_config and not args.mail_headers:
         print(f"{C.RED}Error: provide at least one domain or use -f <file>{C.RESET}")
         sys.exit(1)
 
@@ -2043,7 +2043,7 @@ def main():
     run_watch   = args.watch
     run_compare = args.compare
 
-    if not args.json:
+    if not args.json and domains:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ns = args.resolver or "system"
         print(f"\n{C.BOLD}{C.WHITE}DNS Lookup  {C.DIM}{ts}  resolver={ns}{C.RESET}")
@@ -2115,7 +2115,7 @@ def main():
 
     if args.json:
         print(to_json(all_results))
-    else:
+    elif domains:
         print(f"\n{C.DIM}Done. {total} domain(s) queried.{C.RESET}\n")
 
     if tee:
