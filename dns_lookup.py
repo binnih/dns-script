@@ -921,13 +921,22 @@ def do_subdomain_check(domain, timeout=5.0, extra=None):
 def get_resolver_list(domain, timeout):
     """Return PROPAGATION_RESOLVERS + authoritative NS resolvers for the domain."""
     resolvers = list(PROPAGATION_RESOLVERS)
+    used = {label for label, _ in resolvers}
     for ns_host in resolve_ns(domain, dns.resolver.Resolver()):
         try:
             ns_ip = socket.gethostbyname(ns_host)
-            short = ns_host.split(".")[0]
-            resolvers.append((f"Auth:{short}", ns_ip))
         except Exception:
-            pass
+            continue
+        # Keep labels unique — nameservers can share a first label
+        # (ns1.a.com and ns1.b.com would both be "Auth:ns1").
+        short = ns_host.split(".")[0]
+        label = f"Auth:{short}"
+        n = 2
+        while label in used:
+            label = f"Auth:{short}#{n}"
+            n += 1
+        used.add(label)
+        resolvers.append((label, ns_ip))
     return resolvers
 
 
@@ -1866,16 +1875,28 @@ def to_json(all_results):
 
 # ── Resolver builder ──────────────────────────────────────────────────────────
 
+def _is_ip_literal(addr):
+    """True if addr is a literal IPv4 or IPv6 address."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, addr)
+            return True
+        except OSError:
+            pass
+    return False
+
+
 def build_resolver(nameserver=None, timeout=5.0):
     r = dns.resolver.Resolver()
     r.lifetime = timeout
     if nameserver:
-        try:
-            socket.inet_aton(nameserver)
+        if _is_ip_literal(nameserver):
             resolved_ip = nameserver
-        except socket.error:
+        else:
             try:
-                resolved_ip = socket.gethostbyname(nameserver)
+                # Resolve hostname to an IPv4 or IPv6 address
+                infos = socket.getaddrinfo(nameserver, 53, proto=socket.IPPROTO_UDP)
+                resolved_ip = infos[0][4][0]
             except socket.gaierror as e:
                 print(f"{C.RED}Error: could not resolve resolver hostname '{nameserver}': {e}{C.RESET}")
                 sys.exit(1)
