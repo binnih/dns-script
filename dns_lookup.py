@@ -203,6 +203,11 @@ def resolve_ns(domain, resolver):
         return []
 
 
+def reverse_ip(ip):
+    """Reverse an IPv4 address for PTR / RBL lookups: 1.2.3.4 → 4.3.2.1."""
+    return ".".join(reversed(ip.split(".")))
+
+
 # ── Pretty printer ────────────────────────────────────────────────────────────
 
 def print_domain_header(domain, index=None, total=None):
@@ -651,6 +656,15 @@ def ssl_get_cert(domain, timeout=8, verify=True):
     return cert, protocol
 
 
+def cert_days_left(not_after):
+    """Days until a cert's notAfter string expires, or None if unparseable."""
+    try:
+        exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+        return (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
+    except Exception:
+        return None
+
+
 # ── SSL / TLS certificate check ───────────────────────────────────────────────
 
 def do_ssl_check(domain, timeout=8):
@@ -672,14 +686,10 @@ def do_ssl_check(domain, timeout=8):
 
         # Parse expiry
         exp_color = C.GREEN
-        days_left = None
-        try:
-            exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-            days_left = (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
+        days_left = cert_days_left(not_after)
+        if days_left is not None:
             if days_left < 14:   exp_color = C.RED
             elif days_left < 30: exp_color = C.YELLOW
-        except Exception:
-            pass
 
         # Check domain match
         domain_match = any(
@@ -750,11 +760,7 @@ def do_rbl_check(domain, resolver):
 
     for ip in ips:
         print(f"\n  {C.BOLD}IP: {ip}{C.RESET}")
-        try:
-            rev = ".".join(reversed(ip.split(".")))
-        except Exception:
-            print(f"  {fail('Could not reverse IP')}")
-            continue
+        rev = reverse_ip(ip)
 
         listed_on = []
         errors    = []
@@ -780,10 +786,22 @@ def do_rbl_check(domain, resolver):
 
 # ── CDN / hosting detection ───────────────────────────────────────────────────
 
+def detect_cdn(field_map):
+    """Match NS/A/CNAME values against CDN_SIGNATURES.
+
+    field_map maps lowercase field names ("ns", "a", "cname") to lists of
+    string values. Returns the set of detected provider names.
+    """
+    return {
+        name
+        for name, field, pattern in CDN_SIGNATURES
+        for val in field_map.get(field, [])
+        if re.search(pattern, str(val), re.IGNORECASE)
+    }
+
+
 def do_cdn_detect(domain, resolver):
     print_section_header("CDN / HOSTING DETECTION", C.MAGENTA)
-
-    detected = set()
 
     # Gather NS, A, CNAME values
     field_map = {}
@@ -794,11 +812,7 @@ def do_cdn_detect(domain, resolver):
         except Exception:
             field_map[rtype.lower()] = []
 
-    for name, field, pattern in CDN_SIGNATURES:
-        values = field_map.get(field, [])
-        for val in values:
-            if re.search(pattern, val, re.IGNORECASE):
-                detected.add(name)
+    detected = detect_cdn(field_map)
 
     if detected:
         for name in sorted(detected):
@@ -1132,16 +1146,10 @@ def do_mail_headers(raw_headers=None):
 
     if orig_ip:
         print(f"\n  {C.BOLD}Originating IP: {orig_ip}{C.RESET}")
-        rev = ".".join(reversed(orig_ip.split(".")))
+        rev = reverse_ip(orig_ip)
         # Quick RBL check on originating IP
-        listed = []
         quick_rbls = ["zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org"]
-        for rbl in quick_rbls:
-            try:
-                dns.resolver.resolve(f"{rev}.{rbl}", "A")
-                listed.append(rbl)
-            except Exception:
-                pass
+        listed = [rbl for rbl in quick_rbls if rbl_check_one(rev, rbl)[1]]
         if listed:
             for rbl in listed:
                 print(f"  {fail(f'Originating IP listed on {rbl}')}")
@@ -1237,17 +1245,9 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
 
     # SSL expiry
     try:
-        ctx = ssl.create_default_context()
-        conn = ctx.wrap_socket(
-            socket.create_connection((domain, 443), timeout=timeout),
-            server_hostname=domain
-        )
-        cert = conn.getpeercert()
-        conn.close()
-        not_after = cert.get("notAfter", "")
-        exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-        days = (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
-        row["ssl"] = f"{days}d"
+        cert, _ = ssl_get_cert(domain, timeout, verify=True)
+        days = cert_days_left(cert.get("notAfter", ""))
+        row["ssl"] = f"{days}d" if days is not None else "ERR"
     except Exception:
         row["ssl"] = "ERR"
 
@@ -1282,32 +1282,21 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
     # RBL — quick check on first A IP
     a_ip = row["a"]
     if a_ip and a_ip != "—":
-        rev = ".".join(reversed(a_ip.split(".")))
-        listed = False
-        for rbl in RBL_LISTS[:6]:  # quick subset for summary
-            try:
-                dns.resolver.resolve(f"{rev}.{rbl}", "A")
-                listed = True
-                break
-            except Exception:
-                pass
+        rev = reverse_ip(a_ip)
+        # quick subset for summary
+        listed = any(rbl_check_one(rev, rbl)[1] for rbl in RBL_LISTS[:6])
         row["rbl"] = "LISTED" if listed else "clean"
     else:
         row["rbl"] = "—"
 
     # CDN
-    detected = set()
-    for rtype, store in [("NS", []), ("A", []), ("CNAME", [])]:
-        vals = []
+    field_map = {}
+    for rtype in ("NS", "A", "CNAME"):
         data = dns_results.get(rtype, {})
-        if data.get("status") == "ok":
-            vals = [r[1] for r in data.get("records", [])]
-        store_map = {"NS": [], "A": [], "CNAME": []}
-        store_map[rtype] = vals
-        for name, field, pattern in CDN_SIGNATURES:
-            for v in store_map.get(field, []):
-                if re.search(pattern, str(v), re.IGNORECASE):
-                    detected.add(name)
+        field_map[rtype.lower()] = (
+            [r[1] for r in data.get("records", [])] if data.get("status") == "ok" else []
+        )
+    detected = detect_cdn(field_map)
     row["cdn"] = ", ".join(sorted(detected)) if detected else "—"
 
     return row
