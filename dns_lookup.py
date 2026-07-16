@@ -398,27 +398,100 @@ def parse_dmarc(txt):
     return findings
 
 
-def check_dkim(domain, resolver, extra_selectors=None):
-    selectors = [
-        "default", "google", "k1", "k2", "mail", "mx",
-        "selector1", "selector2", "dkim", "smtp", "email",
-        "proofpoint", "mimecast", "s1", "s2",
-    ]
-    if extra_selectors:
-        selectors = list(extra_selectors) + [s for s in selectors if s not in extra_selectors]
+COMMON_DKIM_SELECTORS = [
+    "default", "google", "k1", "k2", "k3", "mail", "mx",
+    "selector1", "selector2", "dkim", "smtp", "email",
+    "proofpoint", "mimecast", "s1", "s2",
+    "cf2024-1",                                     # Cloudflare
+    "fm1", "fm2", "fm3", "mesmtp",                  # Fastmail
+    "pm", "mandrill", "krs", "mailjet",             # Postmark / Mandrill / Mailgun / Mailjet
+    "zmail", "zoho",                                # Zoho
+    "protonmail", "protonmail2", "protonmail3",     # Proton
+    "hs1", "hs2",                                   # HubSpot
+    "sig1",                                         # iCloud custom domain
+]
 
-    found = []
-    for sel in selectors:
-        qname = f"{sel}._domainkey.{domain}"
+# (substring to match in MX targets or SPF record, provider name, selectors)
+PROVIDER_DKIM_HINTS = [
+    ("mx.cloudflare.net",      "Cloudflare Email Routing", ["cf2024-1"]),
+    ("google.com",             "Google Workspace",         ["google"]),
+    ("protection.outlook.com", "Microsoft 365",            ["selector1", "selector2"]),
+    ("messagingengine.com",    "Fastmail",                 ["fm1", "fm2", "fm3", "mesmtp"]),
+    ("zoho",                   "Zoho Mail",                ["zmail", "zoho"]),
+    ("sendgrid.net",           "SendGrid",                 ["s1", "s2"]),
+    ("mailgun",                "Mailgun",                  ["smtp", "mx", "k1", "krs"]),
+    ("mandrillapp",            "Mandrill",                 ["mandrill"]),
+    ("mcsv.net",               "Mailchimp",                ["k1", "k2", "k3"]),
+    ("mtasv.net",              "Postmark",                 ["pm"]),
+    ("pphosted.com",           "Proofpoint",               ["proofpoint"]),
+    ("mimecast",               "Mimecast",                 ["mimecast"]),
+    ("proton",                 "Proton Mail",              ["protonmail", "protonmail2", "protonmail3"]),
+    ("hubspot",                "HubSpot",                  ["hs1", "hs2"]),
+    ("icloud.com",             "iCloud Mail",              ["sig1"]),
+    ("mailjet",                "Mailjet",                  ["mailjet"]),
+    ("sendinblue",             "Brevo/Sendinblue",         ["mail"]),
+    ("brevo",                  "Brevo",                    ["mail"]),
+    ("amazonses",              "Amazon SES (random selectors — cannot guess)", []),
+]
+
+
+def dkim_provider_hints(domain, resolver):
+    """Inspect MX targets + SPF record; return (provider_names, selectors)."""
+    haystack = []
+    try:
+        for r in resolver.resolve(domain, "MX"):
+            haystack.append(str(r.exchange).lower())
+    except Exception:
+        pass
+    try:
+        for r in resolver.resolve(domain, "TXT"):
+            txt = decode_txt(r)
+            if txt.startswith("v=spf1"):
+                haystack.append(txt.lower())
+    except Exception:
+        pass
+
+    blob = " ".join(haystack)
+    providers, selectors = [], []
+    for pattern, name, sels in PROVIDER_DKIM_HINTS:
+        if pattern in blob:
+            providers.append(name)
+            selectors.extend(s for s in sels if s not in selectors)
+    return providers, selectors
+
+
+def check_dkim(domain, resolver, extra_selectors=None):
+    """Probe DKIM selectors. Returns (found, probed_selectors, provider_names).
+
+    Selector priority: user-supplied > provider-derived (from MX/SPF) > common list.
+    Note: selectors cannot be enumerated via DNS, so an empty result is
+    inconclusive, not proof that DKIM is absent.
+    """
+    providers, provider_sels = dkim_provider_hints(domain, resolver)
+
+    selectors = []
+    for group in (extra_selectors or []), provider_sels, COMMON_DKIM_SELECTORS:
+        for s in group:
+            if s and s not in selectors:
+                selectors.append(s)
+
+    def probe(sel):
         try:
-            answers = resolver.resolve(qname, "TXT")
+            answers = resolver.resolve(f"{sel}._domainkey.{domain}", "TXT")
             for r in answers:
                 txt = decode_txt(r)
                 if "v=DKIM1" in txt or "p=" in txt:
-                    found.append((sel, txt))
+                    return (sel, txt)
         except Exception:
             pass
-    return found
+        return None
+
+    found = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for result in ex.map(probe, selectors):
+            if result:
+                found.append(result)
+    return found, selectors, providers
 
 
 def do_mail_audit(domain, resolver, dkim_selector=None):
@@ -472,12 +545,14 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
         print(f"  {fail(f'DMARC lookup failed: {e}')}")
 
     # DKIM
-    print(f"\n  {C.BOLD}DKIM  (common selectors){C.RESET}")
+    print(f"\n  {C.BOLD}DKIM  (probed selectors){C.RESET}")
     extra = [dkim_selector] if dkim_selector else None
-    dkim_found = check_dkim(domain, resolver, extra_selectors=extra)
+    dkim_found, probed, providers = check_dkim(domain, resolver, extra_selectors=extra)
+    if providers:
+        print(f"  {C.DIM}  Provider hints (MX/SPF): {', '.join(providers)}{C.RESET}")
     if not dkim_found:
-        print(f"  {warn('No DKIM records found for common selectors')}")
-        print(f"  {C.DIM}  Use --dkim-selector SELECTOR to check a specific one{C.RESET}")
+        print(f"  {warn(f'No DKIM records found ({len(probed)} selectors probed) — inconclusive')}")
+        print(f"  {C.DIM}  Selectors cannot be enumerated via DNS; use --dkim-selector SELECTOR if known{C.RESET}")
     else:
         dkim_score = 1
         for sel, txt in dkim_found:
@@ -1286,8 +1361,8 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
     except Exception:
         row["dmarc"] = "missing"
 
-    # DKIM — probe common selectors
-    dkim_found = check_dkim(domain, resolver)
+    # DKIM — probe common + provider-derived selectors
+    dkim_found, _, _ = check_dkim(domain, resolver)
     if dkim_found:
         row["dkim"] = dkim_found[0][0]  # first matched selector name
     else:
