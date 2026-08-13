@@ -277,6 +277,8 @@ def query_domain(domain, types, resolver):
             results[rtype] = {"status": "error", "msg": "No nameservers available"}
         except dns.exception.Timeout:
             results[rtype] = {"status": "error", "msg": "Query timed out"}
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
             results[rtype] = {"status": "error", "msg": str(e)}
     return results
@@ -371,7 +373,7 @@ def parse_spf(txt):
 
 def parse_dmarc(txt):
     findings = []
-    p = re.search(r"\bp=(\w+)", txt)
+    p = re.search(r"\bp=(?![ct])(\S+)", txt)
     policy = p.group(1).lower() if p else None
     if policy == "none":
         findings.append(("warn", "p=none — monitoring only, no enforcement"))
@@ -645,6 +647,9 @@ def http_check_one(url, timeout=8):
                     if location.startswith("/"):
                         p = urlparse(current)
                         location = f"{p.scheme}://{p.netloc}{location}"
+                    elif urlparse(location).netloc:
+                        # Full URL (possibly different domain) — use as-is
+                        pass
                     current = location
                     continue
                 chain.append((current, e.code))
@@ -1353,7 +1358,7 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
         for r in answers:
             txt = decode_txt(r)
             if "DMARC1" in txt:
-                m = re.search(r"p=(\w+)", txt)
+                m = re.search(r"\bp=(\w+)", txt)
                 row["dmarc"] = m.group(1).lower() if m else "found"
                 break
         else:
