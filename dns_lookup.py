@@ -373,8 +373,8 @@ def parse_spf(txt):
 
 def parse_dmarc(txt):
     findings = []
-    p = re.search(r"\bp=(?![ct])(\S+)", txt)
-    policy = p.group(1).lower() if p else None
+    p = re.search(r"\bp=(?![ct])([^;]+)", txt)
+    policy = p.group(1).strip().lower() if p else None
     if policy == "none":
         findings.append(("warn", "p=none — monitoring only, no enforcement"))
     elif policy == "quarantine":
