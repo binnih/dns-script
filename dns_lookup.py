@@ -203,11 +203,6 @@ def resolve_ns(domain, resolver):
         return []
 
 
-def reverse_ip(ip):
-    """Reverse an IPv4 address for PTR / RBL lookups: 1.2.3.4 → 4.3.2.1."""
-    return ".".join(reversed(ip.split(".")))
-
-
 # ── Pretty printer ────────────────────────────────────────────────────────────
 
 def print_domain_header(domain, index=None, total=None):
@@ -277,8 +272,6 @@ def query_domain(domain, types, resolver):
             results[rtype] = {"status": "error", "msg": "No nameservers available"}
         except dns.exception.Timeout:
             results[rtype] = {"status": "error", "msg": "Query timed out"}
-        except (KeyboardInterrupt, SystemExit):
-            raise
         except Exception as e:
             results[rtype] = {"status": "error", "msg": str(e)}
     return results
@@ -373,8 +366,8 @@ def parse_spf(txt):
 
 def parse_dmarc(txt):
     findings = []
-    p = re.search(r"\bp=(?![ct])([^;]+)", txt)
-    policy = p.group(1).strip().lower() if p else None
+    p = re.search(r"\bp=(\w+)", txt)
+    policy = p.group(1).lower() if p else None
     if policy == "none":
         findings.append(("warn", "p=none — monitoring only, no enforcement"))
     elif policy == "quarantine":
@@ -400,100 +393,57 @@ def parse_dmarc(txt):
     return findings
 
 
-COMMON_DKIM_SELECTORS = [
-    "default", "google", "k1", "k2", "k3", "mail", "mx",
+DKIM_SELECTORS = [
+    "default", "google", "k1", "k2", "mail", "mx",
     "selector1", "selector2", "dkim", "smtp", "email",
     "proofpoint", "mimecast", "s1", "s2",
-    "cf2024-1",                                     # Cloudflare
-    "fm1", "fm2", "fm3", "mesmtp",                  # Fastmail
-    "pm", "mandrill", "krs", "mailjet",             # Postmark / Mandrill / Mailgun / Mailjet
-    "zmail", "zoho",                                # Zoho
-    "protonmail", "protonmail2", "protonmail3",     # Proton
-    "hs1", "hs2",                                   # HubSpot
-    "sig1",                                         # iCloud custom domain
-]
-
-# (substring to match in MX targets or SPF record, provider name, selectors)
-PROVIDER_DKIM_HINTS = [
-    ("mx.cloudflare.net",      "Cloudflare Email Routing", ["cf2024-1"]),
-    ("google.com",             "Google Workspace",         ["google"]),
-    ("protection.outlook.com", "Microsoft 365",            ["selector1", "selector2"]),
-    ("messagingengine.com",    "Fastmail",                 ["fm1", "fm2", "fm3", "mesmtp"]),
-    ("zoho",                   "Zoho Mail",                ["zmail", "zoho"]),
-    ("sendgrid.net",           "SendGrid",                 ["s1", "s2"]),
-    ("mailgun",                "Mailgun",                  ["smtp", "mx", "k1", "krs"]),
-    ("mandrillapp",            "Mandrill",                 ["mandrill"]),
-    ("mcsv.net",               "Mailchimp",                ["k1", "k2", "k3"]),
-    ("mtasv.net",              "Postmark",                 ["pm"]),
-    ("pphosted.com",           "Proofpoint",               ["proofpoint"]),
-    ("mimecast",               "Mimecast",                 ["mimecast"]),
-    ("proton",                 "Proton Mail",              ["protonmail", "protonmail2", "protonmail3"]),
-    ("hubspot",                "HubSpot",                  ["hs1", "hs2"]),
-    ("icloud.com",             "iCloud Mail",              ["sig1"]),
-    ("mailjet",                "Mailjet",                  ["mailjet"]),
-    ("sendinblue",             "Brevo/Sendinblue",         ["mail"]),
-    ("brevo",                  "Brevo",                    ["mail"]),
-    ("amazonses",              "Amazon SES (random selectors — cannot guess)", []),
 ]
 
 
-def dkim_provider_hints(domain, resolver):
-    """Inspect MX targets + SPF record; return (provider_names, selectors)."""
-    haystack = []
+def _probe_dkim_selector(sel, domain, resolver):
+    """Return (sel, txt) if a valid DKIM record is found, else None."""
     try:
-        for r in resolver.resolve(domain, "MX"):
-            haystack.append(str(r.exchange).lower())
-    except Exception:
-        pass
-    try:
-        for r in resolver.resolve(domain, "TXT"):
+        answers = resolver.resolve(f"{sel}._domainkey.{domain}", "TXT")
+        for r in answers:
             txt = decode_txt(r)
-            if txt.startswith("v=spf1"):
-                haystack.append(txt.lower())
+            if "v=DKIM1" in txt or "p=" in txt:
+                return (sel, txt)
     except Exception:
         pass
-
-    blob = " ".join(haystack)
-    providers, selectors = [], []
-    for pattern, name, sels in PROVIDER_DKIM_HINTS:
-        if pattern in blob:
-            providers.append(name)
-            selectors.extend(s for s in sels if s not in selectors)
-    return providers, selectors
+    return None
 
 
-def check_dkim(domain, resolver, extra_selectors=None):
-    """Probe DKIM selectors. Returns (found, probed_selectors, provider_names).
+def check_dkim(domain, resolver, extra_selectors=None, quick=False):
+    """Probe DKIM selectors in parallel.
 
-    Selector priority: user-supplied > provider-derived (from MX/SPF) > common list.
-    Note: selectors cannot be enumerated via DNS, so an empty result is
-    inconclusive, not proof that DKIM is absent.
+    Args:
+        extra_selectors: additional selectors to prepend to the default list.
+        quick: stop after the first hit (used by summary table).
+    Returns:
+        list of (selector, txt) tuples.
     """
-    providers, provider_sels = dkim_provider_hints(domain, resolver)
-
+    # Build deduplicated selector list, extras first
+    seen = set()
     selectors = []
-    for group in (extra_selectors or []), provider_sels, COMMON_DKIM_SELECTORS:
-        for s in group:
-            if s and s not in selectors:
-                selectors.append(s)
-
-    def probe(sel):
-        try:
-            answers = resolver.resolve(f"{sel}._domainkey.{domain}", "TXT")
-            for r in answers:
-                txt = decode_txt(r)
-                if "v=DKIM1" in txt or "p=" in txt:
-                    return (sel, txt)
-        except Exception:
-            pass
-        return None
+    for s in (list(extra_selectors or []) + DKIM_SELECTORS):
+        if s not in seen:
+            seen.add(s)
+            selectors.append(s)
 
     found = []
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        for result in ex.map(probe, selectors):
+    with ThreadPoolExecutor(max_workers=min(len(selectors), 15)) as ex:
+        futures = {ex.submit(_probe_dkim_selector, s, domain, resolver): s
+                   for s in selectors}
+        for fut in as_completed(futures):
+            result = fut.result()
             if result:
                 found.append(result)
-    return found, selectors, providers
+                if quick:
+                    # Cancel remaining futures and return immediately
+                    for f in futures:
+                        f.cancel()
+                    return found
+    return found
 
 
 def do_mail_audit(domain, resolver, dkim_selector=None):
@@ -511,7 +461,6 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
     except Exception:
         pass
 
-    spf_findings = parse_spf(spf_records[0]) if len(spf_records) == 1 else []
     if not spf_records:
         print(f"  {fail('No SPF record found')}")
     elif len(spf_records) > 1:
@@ -520,10 +469,10 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
             print(f"  {C.DIM}  {r}{C.RESET}")
     else:
         print(f"  {C.DIM}  {spf_records[0]}{C.RESET}")
-        print_findings(spf_findings)
+        print_findings(parse_spf(spf_records[0]))
 
     # Mail deliverability score
-    spf_score  = 1 if any(l == "ok" for l, _ in spf_findings) else 0
+    spf_score  = 1 if len(spf_records) == 1 and any(l == "ok"   for l, _ in (parse_spf(spf_records[0]) if spf_records else [])) else 0
     dmarc_score = 0
     dkim_score  = 0
 
@@ -547,14 +496,13 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
         print(f"  {fail(f'DMARC lookup failed: {e}')}")
 
     # DKIM
-    print(f"\n  {C.BOLD}DKIM  (probed selectors){C.RESET}")
+    total_sels = len(DKIM_SELECTORS) + (1 if dkim_selector else 0)
+    print(f"\n  {C.BOLD}DKIM  ({total_sels} selectors probed){C.RESET}")
     extra = [dkim_selector] if dkim_selector else None
-    dkim_found, probed, providers = check_dkim(domain, resolver, extra_selectors=extra)
-    if providers:
-        print(f"  {C.DIM}  Provider hints (MX/SPF): {', '.join(providers)}{C.RESET}")
+    dkim_found = check_dkim(domain, resolver, extra_selectors=extra)
     if not dkim_found:
-        print(f"  {warn(f'No DKIM records found ({len(probed)} selectors probed) — inconclusive')}")
-        print(f"  {C.DIM}  Selectors cannot be enumerated via DNS; use --dkim-selector SELECTOR if known{C.RESET}")
+        print(f"  {warn('No DKIM records found for common selectors')}")
+        print(f"  {C.DIM}  Use --dkim-selector SELECTOR to check a specific one{C.RESET}")
     else:
         dkim_score = 1
         for sel, txt in dkim_found:
@@ -647,9 +595,6 @@ def http_check_one(url, timeout=8):
                     if location.startswith("/"):
                         p = urlparse(current)
                         location = f"{p.scheme}://{p.netloc}{location}"
-                    elif urlparse(location).netloc:
-                        # Full URL (possibly different domain) — use as-is
-                        pass
                     current = location
                     continue
                 chain.append((current, e.code))
@@ -692,57 +637,17 @@ def do_http_check(domain):
             print(f"  {sc}{C.BOLD}{label}{C.RESET}  final={sc}{code}{C.RESET}  {C.DIM}{final}{C.RESET}")
 
 
-def _decode_der_cert(der_bytes):
-    """Parse a DER-encoded cert into the dict shape ssl.getpeercert() returns."""
-    import tempfile
-    pem = ssl.DER_cert_to_PEM_cert(der_bytes)
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
-            f.write(pem)
-            tmp = f.name
-        return ssl._ssl._test_decode_cert(tmp)
-    finally:
-        if tmp:
-            os.remove(tmp)
-
-
 def ssl_get_cert(domain, timeout=8, verify=True):
-    """Open a TLS connection and return (cert_dict, protocol).
-
-    Always returns a populated certificate dict. When verify=False, the
-    handshake skips validation and getpeercert() comes back empty, so the
-    certificate is recovered from its DER form instead. Raises on connection
-    failure, or on validation failure when verify=True.
-    """
-    if verify:
-        ctx = ssl.create_default_context()
-    else:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    """Open TLS connection and return (cert_dict, conn) or raise."""
+    ctx = ssl.create_default_context() if verify else ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if not verify:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     conn = ctx.wrap_socket(
         socket.create_connection((domain, 443), timeout=timeout),
         server_hostname=domain
     )
-    try:
-        protocol = conn.version()
-        cert = conn.getpeercert()
-        if not cert:
-            der = conn.getpeercert(binary_form=True)
-            cert = _decode_der_cert(der) if der else {}
-    finally:
-        conn.close()
-    return cert, protocol
-
-
-def cert_days_left(not_after):
-    """Days until a cert's notAfter string expires, or None if unparseable."""
-    try:
-        exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-        return (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
-    except Exception:
-        return None
+    return conn.getpeercert(), conn
 
 
 # ── SSL / TLS certificate check ───────────────────────────────────────────────
@@ -750,36 +655,38 @@ def cert_days_left(not_after):
 def do_ssl_check(domain, timeout=8):
     print_section_header("SSL / TLS CERTIFICATE", C.MAGENTA)
     try:
-        cert, protocol = ssl_get_cert(domain, timeout, verify=False)
-        if not cert:
-            print(f"  {fail('Could not read certificate')}")
-            return
+        cert, conn = ssl_get_cert(domain, timeout, verify=False)
+        conn.close()
 
         subject   = dict(x[0] for x in cert.get("subject", []))
         issuer    = dict(x[0] for x in cert.get("issuer", []))
         not_before = cert.get("notBefore", "")
         not_after  = cert.get("notAfter",  "")
         sans       = [v for t, v in cert.get("subjectAltName", []) if t == "DNS"]
+        protocol   = conn.version() if hasattr(conn, "version") else "unknown"
 
         cn       = subject.get("commonName", "—")
         issuer_o = issuer.get("organizationName", issuer.get("commonName", "—"))
 
         # Parse expiry
         exp_color = C.GREEN
-        days_left = cert_days_left(not_after)
-        if days_left is not None:
+        days_left = None
+        try:
+            exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+            days_left = (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
             if days_left < 14:   exp_color = C.RED
             elif days_left < 30: exp_color = C.YELLOW
+        except Exception:
+            pass
 
         # Check domain match
         domain_match = any(
             re.fullmatch(re.escape(s).replace(r"\*", "[^.]+"), domain)
             for s in sans
-        ) or cn == domain or (cn.startswith("*.") and domain.endswith(cn[1:]))
+        ) or cn == domain or cn.startswith("*.") and domain.endswith(cn[1:])
 
         print(f"  {C.DIM}Common Name :{C.RESET}  {cn}")
         print(f"  {C.DIM}Issuer      :{C.RESET}  {issuer_o}")
-        print(f"  {C.DIM}Protocol    :{C.RESET}  {protocol or 'unknown'}")
         print(f"  {C.DIM}Valid from  :{C.RESET}  {not_before}")
         exp_str = not_after
         if days_left is not None:
@@ -798,16 +705,8 @@ def do_ssl_check(domain, timeout=8):
         else:
             print(f"  {ok(f'Signed by: {issuer_o}')}")
 
-        # Trust / chain validation (separate verifying handshake)
-        try:
-            ssl_get_cert(domain, timeout, verify=True)
-            print(f"  {ok('Certificate is trusted (chain validates)')}")
-        except ssl.SSLCertVerificationError as e:
-            reason = getattr(e, "verify_message", None) or str(e)
-            print(f"  {fail(f'Not trusted: {reason}')}")
-        except Exception:
-            pass
-
+    except ssl.SSLCertVerificationError as e:
+        print(f"  {fail(f'Certificate verification failed: {e}')}")
     except ConnectionRefusedError:
         print(f"  {fail('Port 443 refused — no HTTPS listener')}")
     except socket.timeout:
@@ -821,13 +720,8 @@ def do_ssl_check(domain, timeout=8):
 def rbl_check_one(ip_rev, rbl):
     query = f"{ip_rev}.{rbl}"
     try:
-        answers = [str(r) for r in dns.resolver.resolve(query, "A")]
-        # Real listings are encoded in 127.0.0.x. Codes like 127.255.255.254
-        # mean the query was blocked/rate-limited (e.g. Spamhaus refusing a
-        # public resolver) — that's an error, not a listing.
-        if any(a.startswith("127.0.0.") for a in answers):
-            return rbl, True, None
-        return rbl, None, f"blocked/non-listing response ({', '.join(answers)})"
+        dns.resolver.resolve(query, "A")
+        return rbl, True, None
     except dns.resolver.NXDOMAIN:
         return rbl, False, None
     except Exception as e:
@@ -845,7 +739,11 @@ def do_rbl_check(domain, resolver):
 
     for ip in ips:
         print(f"\n  {C.BOLD}IP: {ip}{C.RESET}")
-        rev = reverse_ip(ip)
+        try:
+            rev = ".".join(reversed(ip.split(".")))
+        except Exception:
+            print(f"  {fail('Could not reverse IP')}")
+            continue
 
         listed_on = []
         errors    = []
@@ -871,22 +769,10 @@ def do_rbl_check(domain, resolver):
 
 # ── CDN / hosting detection ───────────────────────────────────────────────────
 
-def detect_cdn(field_map):
-    """Match NS/A/CNAME values against CDN_SIGNATURES.
-
-    field_map maps lowercase field names ("ns", "a", "cname") to lists of
-    string values. Returns the set of detected provider names.
-    """
-    return {
-        name
-        for name, field, pattern in CDN_SIGNATURES
-        for val in field_map.get(field, [])
-        if re.search(pattern, str(val), re.IGNORECASE)
-    }
-
-
 def do_cdn_detect(domain, resolver):
     print_section_header("CDN / HOSTING DETECTION", C.MAGENTA)
+
+    detected = set()
 
     # Gather NS, A, CNAME values
     field_map = {}
@@ -897,7 +783,11 @@ def do_cdn_detect(domain, resolver):
         except Exception:
             field_map[rtype.lower()] = []
 
-    detected = detect_cdn(field_map)
+    for name, field, pattern in CDN_SIGNATURES:
+        values = field_map.get(field, [])
+        for val in values:
+            if re.search(pattern, val, re.IGNORECASE):
+                detected.add(name)
 
     if detected:
         for name in sorted(detected):
@@ -1001,22 +891,13 @@ def do_subdomain_check(domain, timeout=5.0, extra=None):
 def get_resolver_list(domain, timeout):
     """Return PROPAGATION_RESOLVERS + authoritative NS resolvers for the domain."""
     resolvers = list(PROPAGATION_RESOLVERS)
-    used = {label for label, _ in resolvers}
     for ns_host in resolve_ns(domain, dns.resolver.Resolver()):
         try:
             ns_ip = socket.gethostbyname(ns_host)
+            short = ns_host.split(".")[0]
+            resolvers.append((f"Auth:{short}", ns_ip))
         except Exception:
-            continue
-        # Keep labels unique — nameservers can share a first label
-        # (ns1.a.com and ns1.b.com would both be "Auth:ns1").
-        short = ns_host.split(".")[0]
-        label = f"Auth:{short}"
-        n = 2
-        while label in used:
-            label = f"Auth:{short}#{n}"
-            n += 1
-        used.add(label)
-        resolvers.append((label, ns_ip))
+            pass
     return resolvers
 
 
@@ -1240,10 +1121,16 @@ def do_mail_headers(raw_headers=None):
 
     if orig_ip:
         print(f"\n  {C.BOLD}Originating IP: {orig_ip}{C.RESET}")
-        rev = reverse_ip(orig_ip)
+        rev = ".".join(reversed(orig_ip.split(".")))
         # Quick RBL check on originating IP
+        listed = []
         quick_rbls = ["zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org"]
-        listed = [rbl for rbl in quick_rbls if rbl_check_one(rev, rbl)[1]]
+        for rbl in quick_rbls:
+            try:
+                dns.resolver.resolve(f"{rev}.{rbl}", "A")
+                listed.append(rbl)
+            except Exception:
+                pass
         if listed:
             for rbl in listed:
                 print(f"  {fail(f'Originating IP listed on {rbl}')}")
@@ -1339,9 +1226,17 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
 
     # SSL expiry
     try:
-        cert, _ = ssl_get_cert(domain, timeout, verify=True)
-        days = cert_days_left(cert.get("notAfter", ""))
-        row["ssl"] = f"{days}d" if days is not None else "ERR"
+        ctx = ssl.create_default_context()
+        conn = ctx.wrap_socket(
+            socket.create_connection((domain, 443), timeout=timeout),
+            server_hostname=domain
+        )
+        cert = conn.getpeercert()
+        conn.close()
+        not_after = cert.get("notAfter", "")
+        exp_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+        days = (exp_dt.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
+        row["ssl"] = f"{days}d"
     except Exception:
         row["ssl"] = "ERR"
 
@@ -1358,7 +1253,7 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
         for r in answers:
             txt = decode_txt(r)
             if "DMARC1" in txt:
-                m = re.search(r"\bp=(\w+)", txt)
+                m = re.search(r"p=(\w+)", txt)
                 row["dmarc"] = m.group(1).lower() if m else "found"
                 break
         else:
@@ -1366,31 +1261,39 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
     except Exception:
         row["dmarc"] = "missing"
 
-    # DKIM — probe common + provider-derived selectors
-    dkim_found, _, _ = check_dkim(domain, resolver)
-    if dkim_found:
-        row["dkim"] = dkim_found[0][0]  # first matched selector name
-    else:
-        row["dkim"] = "—"
+    # DKIM — probe common selectors
+    dkim_found = check_dkim(domain, resolver, quick=True)
+    row["dkim"] = dkim_found[0][0] if dkim_found else "—"
 
     # RBL — quick check on first A IP
     a_ip = row["a"]
     if a_ip and a_ip != "—":
-        rev = reverse_ip(a_ip)
-        # quick subset for summary
-        listed = any(rbl_check_one(rev, rbl)[1] for rbl in RBL_LISTS[:6])
+        rev = ".".join(reversed(a_ip.split(".")))
+        listed = False
+        for rbl in RBL_LISTS[:6]:  # quick subset for summary
+            try:
+                dns.resolver.resolve(f"{rev}.{rbl}", "A")
+                listed = True
+                break
+            except Exception:
+                pass
         row["rbl"] = "LISTED" if listed else "clean"
     else:
         row["rbl"] = "—"
 
     # CDN
-    field_map = {}
-    for rtype in ("NS", "A", "CNAME"):
+    detected = set()
+    for rtype, store in [("NS", []), ("A", []), ("CNAME", [])]:
+        vals = []
         data = dns_results.get(rtype, {})
-        field_map[rtype.lower()] = (
-            [r[1] for r in data.get("records", [])] if data.get("status") == "ok" else []
-        )
-    detected = detect_cdn(field_map)
+        if data.get("status") == "ok":
+            vals = [r[1] for r in data.get("records", [])]
+        store_map = {"NS": [], "A": [], "CNAME": []}
+        store_map[rtype] = vals
+        for name, field, pattern in CDN_SIGNATURES:
+            for v in store_map.get(field, []):
+                if re.search(pattern, str(v), re.IGNORECASE):
+                    detected.add(name)
     row["cdn"] = ", ".join(sorted(detected)) if detected else "—"
 
     return row
@@ -1404,12 +1307,14 @@ def do_dnssec(domain, resolver):
         import dns.dnssec
         import dns.rdatatype
         import dns.name
-        import dns.message
     except ImportError:
         print(f"  {warn('dnspython DNSSEC module not available')}")
         return
 
+    domain_name = dns.name.from_text(domain)
+
     # Check DS record at parent
+    parent = ".".join(domain.split(".")[1:])
     ds_found = False
     try:
         ds_ans = resolver.resolve(domain, "DS")
@@ -1550,8 +1455,17 @@ def do_cert_chain(domain, timeout=8):
 
         print(f"  {info(f'Chain length: {len(certs)} certificate(s)')}")
 
-        # Parse subject/issuer of the leaf cert
-        peer, _ = ssl_get_cert(domain, timeout, verify=False)
+        # Parse subject/issuer of each cert using ssl module
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = ctx.wrap_socket(
+            socket.create_connection((domain, 443), timeout=timeout),
+            server_hostname=domain
+        )
+        peer = conn.getpeercert()
+        conn.close()
+
         subject = dict(x[0] for x in peer.get("subject", []))
         issuer  = dict(x[0] for x in peer.get("issuer",  []))
         cn      = subject.get("commonName", "—")
@@ -1565,7 +1479,8 @@ def do_cert_chain(domain, timeout=8):
 
         # Verify chain
         try:
-            ssl_get_cert(domain, timeout, verify=True)
+            _, vc = ssl_get_cert(domain, timeout, verify=True)
+            vc.close()
             print(f"  {ok('Certificate chain validates successfully')}")
         except ssl.SSLCertVerificationError as e:
             print(f"  {fail(f'Chain validation failed: {e}')}")
@@ -1573,9 +1488,10 @@ def do_cert_chain(domain, timeout=8):
     except FileNotFoundError:
         # openssl not available — fall back to ssl module only
         try:
-            ssl_get_cert(domain, timeout, verify=False)  # connectivity check
+            ssl_get_cert(domain, timeout, verify=False)[1].close()
             try:
-                ssl_get_cert(domain, timeout, verify=True)
+                _, vc = ssl_get_cert(domain, timeout, verify=True)
+                vc.close()
                 print(f"  {ok('Certificate chain validates successfully')}")
                 print(f"  {C.DIM}  Install openssl CLI for detailed chain inspection{C.RESET}")
             except ssl.SSLCertVerificationError as e:
@@ -1672,8 +1588,7 @@ def do_ipv6(domain, resolver):
                 rev = dns.reversename.from_address(ip)
                 ptr_answers = resolver.resolve(rev, "PTR")
                 for ptr in ptr_answers:
-                    ptr_name = str(ptr).rstrip(".")
-                    print(f"  {ok(f'{ip} → {ptr_name}')}")
+                    print(f"  {ok(f'{ip} → {str(ptr).rstrip(".")}')}") 
             except Exception:
                 print(f"  {warn(f'{ip} — no PTR record')}")
 
@@ -1955,28 +1870,16 @@ def to_json(all_results):
 
 # ── Resolver builder ──────────────────────────────────────────────────────────
 
-def _is_ip_literal(addr):
-    """True if addr is a literal IPv4 or IPv6 address."""
-    for family in (socket.AF_INET, socket.AF_INET6):
-        try:
-            socket.inet_pton(family, addr)
-            return True
-        except OSError:
-            pass
-    return False
-
-
 def build_resolver(nameserver=None, timeout=5.0):
     r = dns.resolver.Resolver()
     r.lifetime = timeout
     if nameserver:
-        if _is_ip_literal(nameserver):
+        try:
+            socket.inet_aton(nameserver)
             resolved_ip = nameserver
-        else:
+        except socket.error:
             try:
-                # Resolve hostname to an IPv4 or IPv6 address
-                infos = socket.getaddrinfo(nameserver, 53, proto=socket.IPPROTO_UDP)
-                resolved_ip = infos[0][4][0]
+                resolved_ip = socket.gethostbyname(nameserver)
             except socket.gaierror as e:
                 print(f"{C.RED}Error: could not resolve resolver hostname '{nameserver}': {e}{C.RESET}")
                 sys.exit(1)
@@ -2124,7 +2027,7 @@ def main():
     if args.file:
         domains += load_domains_from_file(args.file)
 
-    if not domains and not args.compare and not args.init_config and not args.mail_headers:
+    if not domains and not args.compare and not args.init_config:
         print(f"{C.RED}Error: provide at least one domain or use -f <file>{C.RESET}")
         sys.exit(1)
 
@@ -2149,7 +2052,7 @@ def main():
     run_watch   = args.watch
     run_compare = args.compare
 
-    if not args.json and domains:
+    if not args.json:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ns = args.resolver or "system"
         print(f"\n{C.BOLD}{C.WHITE}DNS Lookup  {C.DIM}{ts}  resolver={ns}{C.RESET}")
@@ -2221,7 +2124,7 @@ def main():
 
     if args.json:
         print(to_json(all_results))
-    elif domains:
+    else:
         print(f"\n{C.DIM}Done. {total} domain(s) queried.{C.RESET}\n")
 
     if tee:
