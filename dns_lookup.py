@@ -39,6 +39,7 @@ try:
     import dns.query
     import dns.zone
     import dns.flags
+    import dns.rdatatype
 except ImportError:
     print("Missing dependency: dnspython")
     print("Install with: pip3 install dnspython")
@@ -455,6 +456,8 @@ PROVIDER_DKIM_HINTS = [
     ("mx.cloudflare.net",      "Cloudflare Email Routing", ["cf2024-1"]),
     ("google.com",             "Google Workspace",         ["google"]),
     ("protection.outlook.com", "Microsoft 365",            ["selector1", "selector2"]),
+    ("mx.microsoft",           "Microsoft 365",            ["selector1", "selector2"]),
+    ("onmicrosoft.com",        "Microsoft 365",            ["selector1", "selector2"]),
     ("messagingengine.com",    "Fastmail",                 ["fm1", "fm2", "fm3", "mesmtp"]),
     ("zoho",                   "Zoho Mail",                ["zmail", "zoho"]),
     ("sendgrid.net",           "SendGrid",                 ["s1", "s2"]),
@@ -494,7 +497,11 @@ def dkim_provider_hints(domain, resolver):
     providers, selectors = [], []
     for pattern, name, sels in PROVIDER_DKIM_HINTS:
         if pattern in blob:
-            providers.append(name)
+            # A provider can match on several patterns — Microsoft 365 fronts
+            # both protection.outlook.com and the newer *.mx.microsoft — so
+            # name it once however many of them hit.
+            if name not in providers:
+                providers.append(name)
             selectors.extend(s for s in sels if s not in selectors)
     return providers, selectors
 
@@ -523,19 +530,42 @@ def classify_dkim_txt(txt):
     return "ok" if "".join(tags["p"].split()) else "revoked"
 
 
+def dangling_cname_target(exc):
+    """Return the CNAME target when a lookup died partway along a CNAME chain.
+
+    A selector whose CNAME is published but whose target does not resolve is a
+    different problem from a selector that was never set up. In Microsoft 365 it
+    is the usual one: the tenant's selector1/selector2 CNAMEs get created in DNS
+    but DKIM signing is never enabled for the domain, so nothing is published
+    behind them. The failed response already carries the CNAME, so recovering it
+    costs no extra query.
+    """
+    try:
+        responses = exc.responses().values()
+    except Exception:
+        return None
+    for resp in responses:
+        for rrset in resp.answer:
+            if rrset.rdtype == dns.rdatatype.CNAME and len(rrset):
+                return str(rrset[0].target).rstrip(".")
+    return None
+
+
 def _probe_dkim_selector(sel, domain, resolver, stop=None):
     """Probe one selector.
 
-    Returns (sel, txt, status) on a hit, (sel, None, "error") when the lookup
-    itself failed, or None when the name does not exist. Keeping those two
-    cases apart stops a resolver timeout from reading as "no DKIM".
+    Returns (sel, txt, status) on a hit, (sel, target, "dangling") when the
+    selector's CNAME leads nowhere, (sel, None, "error") when the lookup itself
+    failed, or None when the name does not exist. Keeping those apart stops a
+    resolver timeout — or a half-finished setup — from reading as "no DKIM".
     """
     if stop is not None and stop.is_set():
         return None
     try:
         answers = resolver.resolve(f"{sel}._domainkey.{domain}", "TXT")
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-        return None
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as e:
+        target = dangling_cname_target(e)
+        return (sel, target, "dangling") if target else None
     except Exception:
         return (sel, None, "error")
 
@@ -579,13 +609,16 @@ def check_dkim(domain, resolver, extra_selectors=None, quick=False):
             result = fut.result()
             if not result:
                 continue
-            if result[2] == "error":
+            status = result[2]
+            if status == "error":
                 errors += 1
                 continue
             found.append(result)
-            if quick:
-                # Queued probes see the event and exit without querying; the
-                # handful already in flight finish on their own.
+            if quick and status == "ok":
+                # Only a real key ends the search — a revoked or dangling
+                # selector is worth reporting but the domain may still have a
+                # working one. Queued probes see the event and exit without
+                # querying; the handful already in flight finish on their own.
                 stop.set()
                 break
     finally:
@@ -664,14 +697,19 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
         print(f"  {C.DIM}  Selectors cannot be enumerated via DNS; use --dkim-selector SELECTOR if known{C.RESET}")
     else:
         for sel, txt, status in dkim_found:
-            display = txt if len(txt) < 100 else txt[:97] + "..."
             if status == "ok":
                 dkim_score = 1
                 print(f"  {ok(f'selector={sel}')}")
             elif status == "revoked":
                 print(f"  {fail(f'selector={sel} — empty p= tag, key is revoked')}")
+            elif status == "dangling":
+                print(f"  {fail(f'selector={sel} — CNAME to {txt}, which does not resolve')}")
+                print(f"  {C.DIM}  The CNAME is published but has no key behind it. In Microsoft 365"
+                      f" this usually means DKIM was never enabled for the domain.{C.RESET}")
+                continue
             else:
                 print(f"  {warn(f'selector={sel} — v=DKIM1 but no p= tag')}")
+            display = txt if len(txt) < 100 else txt[:97] + "..."
             print(f"  {C.DIM}  {display}{C.RESET}")
     if dkim_errors:
         print(f"  {C.DIM}  {dkim_errors} selector lookup(s) failed (timeout / SERVFAIL){C.RESET}")
@@ -1425,7 +1463,7 @@ def print_summary_table(summary_rows):
         dmarc_color = (C.RED    if dmarc in ("none","missing","—")
                        else C.YELLOW if dmarc == "quarantine" else C.GREEN)
         dkim_color  = (C.YELLOW if dkim in ("?", "—")
-                       else C.RED if dkim == "revoked" else C.GREEN)
+                       else C.RED if dkim in ("revoked", "cname-err") else C.GREEN)
         rbl_color   = C.GREEN if rbl == "clean" else C.RED
 
         line = (
@@ -1486,9 +1524,17 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
 
     # DKIM — probe provider-derived and common selectors
     dkim_found, _, _, _ = check_dkim(domain, resolver, quick=True)
+    statuses = [status for _, _, status in dkim_found]
     ok_sels = [s for s, _, status in dkim_found if status == "ok"]
-    # "?" not "—": an unmatched selector is unknown, not known-absent.
-    row["dkim"] = ok_sels[0] if ok_sels else ("revoked" if dkim_found else "?")
+    if ok_sels:
+        row["dkim"] = ok_sels[0]
+    elif "dangling" in statuses:
+        row["dkim"] = "cname-err"
+    elif dkim_found:
+        row["dkim"] = "revoked"
+    else:
+        # "?" not "—": an unmatched selector is unknown, not known-absent.
+        row["dkim"] = "?"
 
     # RBL — quick check on first A IP
     a_ip = row["a"]

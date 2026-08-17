@@ -175,6 +175,120 @@ class DkimSelectorListTests(unittest.TestCase):
                     self.assertIn(sel, dl.COMMON_DKIM_SELECTORS)
 
 
+class FakeRRset(list):
+    def __init__(self, rdtype, target=None):
+        super().__init__([type("RD", (), {"target": target})()] if target else [])
+        self.rdtype = rdtype
+
+
+class FakeResponse:
+    def __init__(self, *rrsets):
+        self.answer = list(rrsets)
+
+
+class FakeNXDOMAIN(Exception):
+    def __init__(self, *responses):
+        self._responses = {f"q{i}": r for i, r in enumerate(responses)}
+
+    def responses(self):
+        return self._responses
+
+
+class DanglingCnameTests(unittest.TestCase):
+    """A published CNAME with a dead target is not the same as no record."""
+
+    def test_cname_target_is_recovered_from_the_failed_response(self):
+        exc = FakeNXDOMAIN(FakeResponse(
+            FakeRRset(dl.dns.rdatatype.CNAME,
+                      "selector1-a-test._domainkey.a.onmicrosoft.com.")))
+        self.assertEqual(dl.dangling_cname_target(exc),
+                         "selector1-a-test._domainkey.a.onmicrosoft.com")
+
+    def test_no_cname_in_the_response_means_no_target(self):
+        exc = FakeNXDOMAIN(FakeResponse(FakeRRset(dl.dns.rdatatype.TXT)))
+        self.assertIsNone(dl.dangling_cname_target(exc))
+
+    def test_empty_response_means_no_target(self):
+        self.assertIsNone(dl.dangling_cname_target(FakeNXDOMAIN()))
+
+    def test_exception_without_responses_is_handled(self):
+        self.assertIsNone(dl.dangling_cname_target(Exception("plain")))
+
+
+class ProbeSelectorTests(unittest.TestCase):
+    """The statuses _probe_dkim_selector hands back drive all the reporting."""
+
+    def _resolver(self, exc):
+        class R:
+            def resolve(inner, name, rtype):
+                raise exc
+        return R()
+
+    def _nxdomain(self, *rrsets):
+        class NX(dl.dns.resolver.NXDOMAIN):
+            def responses(inner):
+                return {"q": FakeResponse(*rrsets)} if rrsets else {}
+        return NX()
+
+    def test_dangling_cname_is_reported(self):
+        exc = self._nxdomain(FakeRRset(dl.dns.rdatatype.CNAME,
+                                       "sel._domainkey.t.onmicrosoft.com."))
+        sel, target, status = dl._probe_dkim_selector(
+            "selector1", "a.test", self._resolver(exc))
+        self.assertEqual((sel, status), ("selector1", "dangling"))
+        self.assertEqual(target, "sel._domainkey.t.onmicrosoft.com")
+
+    def test_plain_nxdomain_is_a_plain_absence(self):
+        self.assertIsNone(dl._probe_dkim_selector(
+            "nope", "a.test", self._resolver(self._nxdomain())))
+
+    def test_timeout_is_an_error_not_an_absence(self):
+        result = dl._probe_dkim_selector(
+            "s", "a.test", self._resolver(dl.dns.exception.Timeout()))
+        self.assertEqual(result[2], "error")
+
+    def test_stop_event_short_circuits_before_querying(self):
+        import threading
+        stop = threading.Event()
+        stop.set()
+
+        class Boom:
+            def resolve(inner, name, rtype):
+                raise AssertionError("should not query once stopped")
+
+        self.assertIsNone(dl._probe_dkim_selector("s", "a.test", Boom(), stop))
+
+
+class ProviderHintTests(unittest.TestCase):
+    def matches(self, blob):
+        return [name for pattern, name, _ in dl.PROVIDER_DKIM_HINTS
+                if pattern in blob]
+
+    def test_classic_microsoft_mx_is_recognised(self):
+        self.assertIn("Microsoft 365",
+                      self.matches("a-com.mail.protection.outlook.com."))
+
+    def test_newer_microsoft_mx_is_recognised(self):
+        # Tenants are being moved to *.mx.microsoft, which contains none of
+        # the older patterns.
+        self.assertIn("Microsoft 365", self.matches("a-com.h-v1.mx.microsoft."))
+
+    def test_a_provider_is_named_only_once(self):
+        # Three patterns map to Microsoft 365; a domain hitting several of them
+        # should still be reported once.
+        blob = "a.mail.protection.outlook.com. a.h-v1.mx.microsoft. a.onmicrosoft.com."
+        providers, _ = self._hints_for(blob)
+        self.assertEqual(providers.count("Microsoft 365"), 1)
+
+    def _hints_for(self, blob):
+        class R:
+            def resolve(inner, name, rtype):
+                if rtype == "MX":
+                    return [type("MX", (), {"exchange": blob})()]
+                raise dl.dns.resolver.NXDOMAIN
+        return dl.dkim_provider_hints("a.test", R())
+
+
 class StructureRecordTests(unittest.TestCase):
     """--json must emit the parts, not the padded display string."""
 
