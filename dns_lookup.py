@@ -175,9 +175,39 @@ def format_record(rtype, rdata):
     return str(rdata)
 
 
+def structure_record(rtype, rdata):
+    """Return a record's parts as a dict, for JSON output.
+
+    format_record renders records for a terminal — padded, labelled, meant to
+    be read. Consumers of --json need the parts themselves, so compound types
+    get typed fields here and the display string is kept separate. Types with
+    nothing to decompose keep the single "value" key they have always had.
+    """
+    if rtype == "MX":
+        return {"preference": rdata.preference,
+                "exchange": str(rdata.exchange).rstrip(".")}
+    if rtype == "SOA":
+        return {"mname": str(rdata.mname).rstrip("."),
+                "rname": str(rdata.rname).rstrip("."),
+                "serial": rdata.serial, "refresh": rdata.refresh,
+                "retry": rdata.retry, "expire": rdata.expire,
+                "minimum": rdata.minimum}
+    if rtype == "SRV":
+        return {"priority": rdata.priority, "weight": rdata.weight,
+                "port": rdata.port, "target": str(rdata.target).rstrip(".")}
+    if rtype == "CAA":
+        return {"flags": rdata.flags, "tag": rdata.tag.decode(),
+                "value": rdata.value.decode()}
+    if rtype == "TXT":
+        return {"value": decode_txt(rdata)}
+    return {"value": str(rdata)}
+
+
 def lookup(domain, rtype, resolver):
+    """Return (ttl, display_string, fields_dict) for each record."""
     answers = resolver.resolve(domain, rtype)
-    return [(answers.rrset.ttl, format_record(rtype, r)) for r in answers]
+    return [(answers.rrset.ttl, format_record(rtype, r), structure_record(rtype, r))
+            for r in answers]
 
 
 def decode_txt(rdata):
@@ -241,7 +271,7 @@ def print_section(rtype, records):
     desc = DESCRIPTIONS.get(rtype, "")
     print(f"\n  {C.BOLD}{C.YELLOW}{rtype:<8}{C.DIM}{C.WHITE}  {desc}{C.RESET}")
     print(f"  {C.DIM}{'─' * 56}{C.RESET}")
-    for ttl, val in records:
+    for ttl, val, _fields in records:
         ttl_str = f"{C.DIM}[TTL {ttl:>6}]{C.RESET}"
         print(f"  {ttl_str}  {C.GREEN}{val}{C.RESET}")
 
@@ -1846,7 +1876,7 @@ def flatten_results(results):
     out = {}
     for rtype, data in sorted(results.items()):
         if data["status"] == "ok":
-            out[rtype] = sorted(v for _, v in data["records"])
+            out[rtype] = sorted(v for _, v, _f in data["records"])
         else:
             out[rtype] = [data["status"]]
     return out
@@ -2030,7 +2060,7 @@ def to_json(all_results):
         for rtype, data in results.items():
             if data["status"] == "ok":
                 out[domain][rtype] = [
-                    {"ttl": ttl, "value": val} for ttl, val in data["records"]
+                    dict(ttl=ttl, **fields) for ttl, _display, fields in data["records"]
                 ]
             else:
                 out[domain][rtype] = {"error": data["status"], "msg": data.get("msg", "")}

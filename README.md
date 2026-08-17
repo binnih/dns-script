@@ -274,6 +274,20 @@ python3 dns_lookup.py --init-config
 
 ---
 
+## Tests
+
+```bash
+python3 -m unittest discover
+```
+
+Covers the record-parsing logic — TXT string joining, DKIM record
+classification, SPF and DMARC parsing, RBL response codes, and the JSON field
+mapping. No network access, so the suite runs in milliseconds. These are the
+functions where the bugs have historically been, and the suite is verified to
+fail if any of them is reintroduced.
+
+---
+
 ## Notes
 
 - If a domain does not exist (NXDOMAIN), remaining record type lookups are skipped since there is nothing to query.
