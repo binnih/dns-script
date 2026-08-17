@@ -181,8 +181,14 @@ def lookup(domain, rtype, resolver):
 
 
 def decode_txt(rdata):
-    """Join all strings in a TXT record into a single string."""
-    return " ".join(
+    """Join all strings in a TXT record into a single string.
+
+    Records over 255 bytes are split into several strings, which concatenate
+    with no separator (RFC 7208 §3.3, RFC 6376 §3.6.2.2). Joining with a space
+    instead would splice one into the middle of a long DKIM key or an SPF
+    mechanism that happens to straddle the boundary.
+    """
+    return "".join(
         p.decode(errors="replace") if isinstance(p, bytes) else p
         for p in rdata.strings
     )
@@ -482,9 +488,9 @@ def classify_dkim_txt(txt):
         return None
     if "p" not in tags:
         return "malformed" if version else None
-    # Keys over 255 bytes span several TXT strings, which decode_txt joins with
-    # spaces — strip them before testing whether the key is actually empty.
-    return "ok" if tags["p"].replace(" ", "") else "revoked"
+    # Tag values may carry folding whitespace; strip it before deciding whether
+    # the key is genuinely empty (revoked) rather than merely wrapped.
+    return "ok" if "".join(tags["p"].split()) else "revoked"
 
 
 def _probe_dkim_selector(sel, domain, resolver, stop=None):
@@ -592,14 +598,23 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
     print(f"\n  {C.BOLD}DMARC{C.RESET}")
     try:
         answers = resolver.resolve(f"_dmarc.{domain}", "TXT")
-        for r in answers:
-            txt = decode_txt(r)
-            if "DMARC1" in txt:
+        dmarc_records = [t for t in (decode_txt(r) for r in answers) if "DMARC1" in t]
+        if not dmarc_records:
+            # The name resolves but carries no policy — a leftover verification
+            # TXT, say — which for mail purposes is the same as having none.
+            print(f"  {fail(f'No DMARC policy at _dmarc.{domain} (name exists but has no v=DMARC1 record)')}")
+        elif len(dmarc_records) > 1:
+            # RFC 7489 §6.6.3: more than one record means the set is ignored.
+            print(f"  {fail(f'{len(dmarc_records)} DMARC records found — the set is ignored, must be exactly one')}")
+            for txt in dmarc_records:
                 print(f"  {C.DIM}  {txt}{C.RESET}")
-                findings = parse_dmarc(txt)
-                print_findings(findings)
-                if any(l == "ok" for l, _ in findings):
-                    dmarc_score = 1
+        else:
+            txt = dmarc_records[0]
+            print(f"  {C.DIM}  {txt}{C.RESET}")
+            findings = parse_dmarc(txt)
+            print_findings(findings)
+            if any(l == "ok" for l, _ in findings):
+                dmarc_score = 1
     except dns.resolver.NXDOMAIN:
         print(f"  {fail('No DMARC record (_dmarc.' + domain + ' NXDOMAIN)')}")
     except dns.resolver.NoAnswer:
@@ -1752,9 +1767,6 @@ def do_ipv6(domain, resolver):
 
 
 # ── Config file ───────────────────────────────────────────────────────────────
-
-import configparser
-import os
 
 CONFIG_PATH = os.path.expanduser("~/.dns_lookup.conf")
 
