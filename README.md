@@ -132,7 +132,7 @@ Registrar, created/updated/expiry dates, domain status, nameservers. Expiry colo
 ### Mail audit (`--mail-audit`)
 **SPF** — detects `+all` / `~all` / `-all`, lists includes, warns if lookup count exceeds the RFC limit of 10.  
 **DMARC** — reports policy (`none`/`quarantine`/`reject`), `pct=` coverage, missing `rua=`.  
-**DKIM** — probes 15 common selectors automatically.  
+**DKIM** — detects the mail provider from MX/SPF and probes its known selectors first, then 33 common ones. Flags revoked keys (empty `p=`). Selectors cannot be enumerated via DNS, so no match is reported as inconclusive rather than as "no DKIM".  
 **Deliverability score** — combined 0–3 rating (Poor / Weak / Fair / Good).
 
 ### Email header analyser (`--mail-headers`)
