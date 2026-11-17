@@ -289,6 +289,128 @@ class ProviderHintTests(unittest.TestCase):
         return dl.dkim_provider_hints("a.test", R())
 
 
+class DateSelectorTests(unittest.TestCase):
+    def test_covers_this_year_and_the_two_before(self):
+        self.assertEqual(dl.date_dkim_selectors(2026),
+                         ["2026", "2025", "2024",
+                          "dkim2026", "dkim2025", "dkim2024"])
+
+    def test_none_duplicate_the_common_list(self):
+        for sel in dl.date_dkim_selectors(2026):
+            with self.subTest(sel=sel):
+                self.assertNotIn(sel, dl.COMMON_DKIM_SELECTORS)
+
+
+class DkimNamespaceTests(unittest.TestCase):
+    """_domainkey.<domain> existing or not is what makes a miss conclusive."""
+
+    def _resolver(self, domainkey, control):
+        """Each outcome is "nodata", "answer", "nxdomain" or an exception."""
+        def outcome(o):
+            if o == "nodata":
+                raise dl.dns.resolver.NoAnswer
+            if o == "nxdomain":
+                raise dl.dns.resolver.NXDOMAIN
+            if isinstance(o, Exception):
+                raise o
+            return [FakeTXT("x")]
+
+        class R:
+            def resolve(inner, name, rtype):
+                return outcome(domainkey if name.startswith("_domainkey.")
+                               else control)
+        return R()
+
+    def state(self, domainkey, control="nxdomain"):
+        return dl.dkim_namespace_state("a.test",
+                                       self._resolver(domainkey, control))
+
+    def test_empty_non_terminal_means_selectors_exist(self):
+        self.assertEqual(self.state("nodata"), "present")
+
+    def test_a_record_at_domainkey_itself_also_counts(self):
+        self.assertEqual(self.state("answer"), "present")
+
+    def test_nxdomain_means_nothing_is_published(self):
+        self.assertEqual(self.state("nxdomain"), "absent")
+
+    def test_wildcard_makes_the_answer_meaningless(self):
+        # The random control name exists too, so "present" would be a guess.
+        self.assertEqual(self.state("nodata", control="answer"), "unknown")
+        self.assertEqual(self.state("nodata", control="nodata"), "unknown")
+
+    def test_lookup_failure_is_unknown_not_absent(self):
+        self.assertEqual(self.state(dl.dns.exception.Timeout()), "unknown")
+        self.assertEqual(self.state("nodata", control=dl.dns.exception.Timeout()),
+                         "unknown")
+
+    def test_control_name_is_random_and_under_the_domain(self):
+        controls = []
+
+        class R:
+            def resolve(inner, name, rtype):
+                if name.startswith("_domainkey."):
+                    raise dl.dns.resolver.NoAnswer
+                controls.append(name)
+                raise dl.dns.resolver.NXDOMAIN
+        dl.dkim_namespace_state("a.test", R())
+        dl.dkim_namespace_state("a.test", R())
+        self.assertEqual(len(controls), 2)
+        for c in controls:
+            self.assertTrue(c.endswith(".a.test"))
+        self.assertNotEqual(controls[0], controls[1])
+
+
+class DkimWildcardTests(unittest.TestCase):
+    """A *._domainkey wildcard is one record, not one per probed selector."""
+
+    def _resolver(self, wildcard_txt=None, keys=None):
+        keys = keys or {}
+
+        class R:
+            def resolve(inner, name, rtype):
+                if rtype != "TXT" or not name.endswith("._domainkey.a.test"):
+                    raise dl.dns.resolver.NXDOMAIN
+                sel = name[:-len("._domainkey.a.test")]
+                if sel in keys:
+                    return [FakeTXT(keys[sel])]
+                if wildcard_txt is not None:
+                    return [FakeTXT(wildcard_txt)]
+                raise dl.dns.resolver.NXDOMAIN
+        return R()
+
+    def test_null_key_wildcard_collapses_to_one_result(self):
+        found, _, _, _, wild = dl.check_dkim(
+            "a.test", self._resolver(wildcard_txt="v=DKIM1; p="))
+        self.assertEqual(found, [])
+        self.assertEqual(wild, ("v=DKIM1; p=", "revoked"))
+
+    def test_real_selectors_survive_alongside_a_wildcard(self):
+        found, _, _, _, wild = dl.check_dkim(
+            "a.test", self._resolver(wildcard_txt="v=DKIM1; p=",
+                                     keys={"google": "v=DKIM1; p=KEY"}))
+        self.assertEqual([(s, st) for s, _, st in found], [("google", "ok")])
+        self.assertEqual(wild[1], "revoked")
+
+    def test_no_wildcard_leaves_hits_alone(self):
+        found, _, _, _, wild = dl.check_dkim(
+            "a.test", self._resolver(keys={"s1": "p=A", "s2": "p=B"}))
+        self.assertIsNone(wild)
+        self.assertEqual(sorted(s for s, _, _ in found), ["s1", "s2"])
+
+    def test_failed_wildcard_probe_does_not_merge(self):
+        class R:
+            def resolve(inner, name, rtype):
+                if name.startswith("_nx-"):
+                    raise dl.dns.exception.Timeout
+                if name.endswith("._domainkey.a.test"):
+                    return [FakeTXT("v=DKIM1; p=")]
+                raise dl.dns.resolver.NXDOMAIN
+        found, probed, _, _, wild = dl.check_dkim("a.test", R())
+        self.assertIsNone(wild)
+        self.assertEqual(len(found), len(probed))
+
+
 class StructureRecordTests(unittest.TestCase):
     """--json must emit the parts, not the padded display string."""
 

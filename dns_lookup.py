@@ -23,6 +23,7 @@ import urllib.error
 import ssl
 import time
 import threading
+import secrets
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
@@ -449,7 +450,27 @@ COMMON_DKIM_SELECTORS = [
     "protonmail", "protonmail2", "protonmail3",     # Proton
     "hs1", "hs2",                                   # HubSpot
     "sig1",                                         # iCloud custom domain
+    "s1024", "s2048",                               # Yahoo / AOL
+    "mte1", "mte2",                                 # Mailchimp Transactional
+    "brevo1", "brevo2",                             # Brevo
+    "ctct1", "ctct2",                               # Constant Contact
+    "zendesk1", "zendesk2",                         # Zendesk
+    "sf1", "sf2",                                   # Salesforce
+    "kl", "kl2",                                    # Klaviyo
+    "key1", "key2", "dkim1", "mail1", "selector",   # common hand-picked names
 ]
+
+
+def date_dkim_selectors(year=None):
+    """Selectors named after the key's rotation year ("2025", "dkim2025").
+
+    Kept out of COMMON_DKIM_SELECTORS because they move with the calendar:
+    the current year and the two before it cover a normal rotation cycle.
+    """
+    if year is None:
+        year = time.localtime().tm_year
+    years = range(year, year - 3, -1)
+    return [f"{y}" for y in years] + [f"dkim{y}" for y in years]
 
 # (substring to match in MX targets or SPF record, provider name, selectors)
 PROVIDER_DKIM_HINTS = [
@@ -462,8 +483,8 @@ PROVIDER_DKIM_HINTS = [
     ("zoho",                   "Zoho Mail",                ["zmail", "zoho"]),
     ("sendgrid.net",           "SendGrid",                 ["s1", "s2"]),
     ("mailgun",                "Mailgun",                  ["smtp", "mx", "k1", "krs"]),
-    ("mandrillapp",            "Mandrill",                 ["mandrill"]),
-    ("mcsv.net",               "Mailchimp",                ["k1", "k2", "k3"]),
+    ("mandrillapp",            "Mandrill",                 ["mandrill", "mte1", "mte2"]),
+    ("mcsv.net",               "Mailchimp",                ["k1", "k2", "k3", "mte1", "mte2"]),
     ("mtasv.net",              "Postmark",                 ["pm"]),
     ("pphosted.com",           "Proofpoint",               ["proofpoint"]),
     ("mimecast",               "Mimecast",                 ["mimecast"]),
@@ -471,8 +492,12 @@ PROVIDER_DKIM_HINTS = [
     ("hubspot",                "HubSpot",                  ["hs1", "hs2"]),
     ("icloud.com",             "iCloud Mail",              ["sig1"]),
     ("mailjet",                "Mailjet",                  ["mailjet"]),
-    ("sendinblue",             "Brevo/Sendinblue",         ["mail"]),
-    ("brevo",                  "Brevo",                    ["mail"]),
+    ("sendinblue",             "Brevo/Sendinblue",         ["mail", "brevo1", "brevo2"]),
+    ("brevo",                  "Brevo",                    ["mail", "brevo1", "brevo2"]),
+    ("yahoodns.net",           "Yahoo Mail",               ["s1024", "s2048"]),
+    ("constantcontact",        "Constant Contact",         ["ctct1", "ctct2"]),
+    ("zendesk.com",            "Zendesk",                  ["zendesk1", "zendesk2"]),
+    ("salesforce.com",         "Salesforce",               ["sf1", "sf2"]),
     ("amazonses",              "Amazon SES (random selectors — cannot guess)", []),
 ]
 
@@ -577,6 +602,44 @@ def _probe_dkim_selector(sel, domain, resolver, stop=None):
     return None
 
 
+def dkim_namespace_state(domain, resolver):
+    """Say whether anything at all is published under _domainkey.<domain>.
+
+    Selectors cannot be listed, but their parent can be tested: under RFC 8020
+    a name with records below it exists even when it holds none itself, so
+    _domainkey.<domain> answers NOERROR/NODATA when any selector is published
+    and NXDOMAIN when none is. That turns "no guessed selector matched" into
+    either "keys exist under a selector we did not guess" or "nothing there".
+
+    Only "present" is conclusive. Some authoritative servers break RFC 8020 and
+    answer NXDOMAIN for a name that exists only because of the records below
+    it — AWS Route 53 does this for python.org, whose google._domainkey key
+    resolves while _domainkey.python.org is NXDOMAIN — so "absent" means
+    "probably nothing published", never "DKIM is missing".
+
+    Returns "present", "absent", or "unknown". A random sibling name is asked
+    as a control: a wildcard, or a server that answers NOERROR for everything,
+    makes the control exist too, and then the answer proves nothing.
+    """
+    def exists(name):
+        try:
+            resolver.resolve(name, "TXT")
+        except dns.resolver.NoAnswer:
+            pass
+        except dns.resolver.NXDOMAIN as e:
+            # A CNAME that leads nowhere still means the name was published.
+            return dangling_cname_target(e) is not None
+        return True
+
+    try:
+        if not exists(f"_domainkey.{domain}"):
+            return "absent"
+        control = f"_nx-{secrets.token_hex(6)}.{domain}"
+        return "unknown" if exists(control) else "present"
+    except Exception:
+        return "unknown"
+
+
 def check_dkim(domain, resolver, extra_selectors=None, quick=False):
     """Probe DKIM selectors in parallel.
 
@@ -588,13 +651,17 @@ def check_dkim(domain, resolver, extra_selectors=None, quick=False):
         extra_selectors: additional selectors to probe first.
         quick: stop at the first hit (used by the summary table).
     Returns:
-        (found, probed_selectors, providers, errors) where found is a list of
-        (selector, txt, status) and errors counts selectors whose lookup failed.
+        (found, probed_selectors, providers, errors, wildcard) where found is a
+        list of (selector, txt, status), errors counts selectors whose lookup
+        failed, and wildcard is (txt, status) when *._domainkey answers for any
+        selector at all, else None. Selectors that only echo the wildcard are
+        left out of found: they are the wildcard, not keys of their own.
     """
     providers, provider_sels = dkim_provider_hints(domain, resolver)
 
     selectors = []
-    for group in (extra_selectors or []), provider_sels, COMMON_DKIM_SELECTORS:
+    for group in ((extra_selectors or []), provider_sels, COMMON_DKIM_SELECTORS,
+                  date_dkim_selectors()):
         for s in group:
             if s and s not in selectors:
                 selectors.append(s)
@@ -623,7 +690,26 @@ def check_dkim(domain, resolver, extra_selectors=None, quick=False):
                 break
     finally:
         ex.shutdown(wait=False)
-    return found, selectors, providers, errors
+
+    wildcard = dkim_wildcard(domain, resolver) if found else None
+    if wildcard:
+        found = [f for f in found if (f[1], f[2]) != wildcard]
+    return found, selectors, providers, errors, wildcard
+
+
+def dkim_wildcard(domain, resolver):
+    """Return (txt, status) if a made-up selector resolves, else None.
+
+    A *._domainkey wildcard answers every probe with the same record —
+    commonly an empty p= key, published to say the domain sends no mail
+    (M3AAWG's advice for parked domains) — which would otherwise be reported
+    once per probed selector. A failed lookup returns None, leaving the hits
+    unmerged rather than guessing.
+    """
+    result = _probe_dkim_selector(f"_nx-{secrets.token_hex(6)}", domain, resolver)
+    if not result or result[2] == "error":
+        return None
+    return (result[1], result[2])
 
 
 def do_mail_audit(domain, resolver, dkim_selector=None):
@@ -687,12 +773,40 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
 
     # DKIM
     extra = [dkim_selector] if dkim_selector else None
-    dkim_found, probed, providers, dkim_errors = check_dkim(
+    dkim_found, probed, providers, dkim_errors, dkim_wild = check_dkim(
         domain, resolver, extra_selectors=extra)
     print(f"\n  {C.BOLD}DKIM  ({len(probed)} selectors probed){C.RESET}")
     if providers:
         print(f"  {C.DIM}  Provider hints (MX/SPF): {', '.join(providers)}{C.RESET}")
-    if not dkim_found:
+    dkim_ns = None if dkim_found or dkim_wild else dkim_namespace_state(domain, resolver)
+    if dkim_wild:
+        wtxt, wstatus = dkim_wild
+        name = f"*._domainkey.{domain}"
+        if wstatus == "revoked":
+            print(f"  {fail(f'Wildcard {name} returns an empty (revoked) key for every selector')}")
+            print(f"  {C.DIM}  The usual way to say a domain sends no mail: any signature claiming it fails."
+                  f" Fine for a parked domain, wrong for one that sends.{C.RESET}")
+        elif wstatus == "ok":
+            dkim_score = 1
+            print(f"  {warn(f'Wildcard {name} returns the same key for every selector')}")
+            print(f"  {C.DIM}  Signatures verify whatever selector they name; selectors below are only"
+                  f" those with a key of their own.{C.RESET}")
+        elif wstatus == "dangling":
+            print(f"  {fail(f'Wildcard {name} is a CNAME to {wtxt}, which does not resolve')}")
+        else:
+            print(f"  {warn(f'Wildcard {name} returns v=DKIM1 with no p= tag for every selector')}")
+        if wstatus != "dangling":
+            display = wtxt if len(wtxt) < 100 else wtxt[:97] + "..."
+            print(f"  {C.DIM}  {display}{C.RESET}")
+    if dkim_ns == "absent":
+        print(f"  {warn(f'No DKIM key found in {len(probed)} probed selectors, and _domainkey.{domain} is NXDOMAIN')}")
+        print(f"  {C.DIM}  Probably nothing is published, but some DNS hosts (AWS Route 53, for one) answer NXDOMAIN"
+              f" there even when selectors exist; use --dkim-selector SELECTOR if known{C.RESET}")
+    elif dkim_ns == "present":
+        print(f"  {warn(f'Records exist under _domainkey.{domain}, but none of the {len(probed)} probed selectors match')}")
+        print(f"  {C.DIM}  DKIM is probably set up under a selector that cannot be guessed; find it in the s= tag of a"
+              f" DKIM-Signature header and pass --dkim-selector SELECTOR{C.RESET}")
+    elif not dkim_found and not dkim_wild:
         print(f"  {warn(f'No DKIM key found in {len(probed)} probed selectors — inconclusive')}")
         print(f"  {C.DIM}  Selectors cannot be enumerated via DNS; use --dkim-selector SELECTOR if known{C.RESET}")
     else:
@@ -721,7 +835,7 @@ def do_mail_audit(domain, resolver, dkim_selector=None):
     sc = score_colors[score]
     lb = labels[score]
     print(f"\n  {C.BOLD}Deliverability score:{C.RESET}  {sc}{C.BOLD}{score}/3  {lb}{C.RESET}")
-    if not dkim_found:
+    if not dkim_found and not dkim_wild:
         print(f"  {C.DIM}  DKIM counted as 0 — no selector matched, which is inconclusive"
               f" rather than proof DKIM is absent{C.RESET}")
 
@@ -1462,7 +1576,7 @@ def print_summary_table(summary_rows):
                        else C.YELLOW if http_st.startswith("3") else C.GREEN)
         dmarc_color = (C.RED    if dmarc in ("none","missing","—")
                        else C.YELLOW if dmarc == "quarantine" else C.GREEN)
-        dkim_color  = (C.YELLOW if dkim in ("?", "—")
+        dkim_color  = (C.YELLOW if dkim in ("?", "—", "unguessed")
                        else C.RED if dkim in ("revoked", "cname-err") else C.GREEN)
         rbl_color   = C.GREEN if rbl == "clean" else C.RED
 
@@ -1523,7 +1637,10 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
         row["dmarc"] = "missing"
 
     # DKIM — probe provider-derived and common selectors
-    dkim_found, _, _, _ = check_dkim(domain, resolver, quick=True)
+    dkim_found, _, _, _, dkim_wild = check_dkim(domain, resolver, quick=True)
+    if dkim_wild:
+        # Judge the wildcard like any other hit; "*" stands in for a selector.
+        dkim_found = dkim_found + [("*", dkim_wild[0], dkim_wild[1])]
     statuses = [status for _, _, status in dkim_found]
     ok_sels = [s for s, _, status in dkim_found if status == "ok"]
     if ok_sels:
@@ -1532,6 +1649,9 @@ def collect_summary_row(domain, dns_results, resolver, timeout):
         row["dkim"] = "cname-err"
     elif dkim_found:
         row["dkim"] = "revoked"
+    elif dkim_namespace_state(domain, resolver) == "present":
+        # Keys exist, just not under any selector we know.
+        row["dkim"] = "unguessed"
     else:
         # "?" not "—": an unmatched selector is unknown, not known-absent.
         row["dkim"] = "?"
